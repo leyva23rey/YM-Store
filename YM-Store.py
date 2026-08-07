@@ -1,7 +1,7 @@
 import os
 import secrets
-from datetime import datetime, date
-from decimal import Decimal
+from datetime import datetime, date, timedelta
+from decimal import Decimal, InvalidOperation
 from functools import wraps
 from pathlib import Path
 
@@ -10,6 +10,9 @@ from flask import (
     send_from_directory, abort, render_template_string
 )
 from flask_sqlalchemy import SQLAlchemy
+from flask_wtf.csrf import CSRFProtect
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from sqlalchemy import func
 from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -25,18 +28,55 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "ym-store-cambia-esta-clave-en-produccion")
-app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
-    "DATABASE_URL",
-    "sqlite:///" + str(BASE_DIR / "ym_store.db")
+
+# Entorno seguro: Render se considera producción automáticamente.
+APP_ENV = os.getenv("APP_ENV", "development").lower()
+IS_PRODUCTION = APP_ENV == "production" or os.getenv("RENDER", "").lower() == "true"
+
+secret_key = os.getenv("SECRET_KEY")
+if IS_PRODUCTION and not secret_key:
+    raise RuntimeError("SECRET_KEY es obligatoria en producción. Configúrala como variable de entorno.")
+app.config["SECRET_KEY"] = secret_key or secrets.token_hex(32)
+
+raw_database_url = os.getenv("DATABASE_URL")
+if IS_PRODUCTION and not raw_database_url:
+    raise RuntimeError("DATABASE_URL es obligatoria en producción. Usa PostgreSQL; no publiques con SQLite.")
+if not raw_database_url:
+    raw_database_url = "sqlite:///" + str(BASE_DIR / "ym_store.db")
+if raw_database_url.startswith("postgres://"):
+    raw_database_url = raw_database_url.replace("postgres://", "postgresql+psycopg://", 1)
+elif raw_database_url.startswith("postgresql://"):
+    raw_database_url = raw_database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+app.config.update(
+    SQLALCHEMY_DATABASE_URI=raw_database_url,
+    SQLALCHEMY_TRACK_MODIFICATIONS=False,
+    MAX_CONTENT_LENGTH=8 * 1024 * 1024,
+    UPLOAD_FOLDER=str(UPLOAD_DIR),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=IS_PRODUCTION,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
+    WTF_CSRF_TIME_LIMIT=7200,
 )
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
-app.config["UPLOAD_FOLDER"] = str(UPLOAD_DIR)
 
 db = SQLAlchemy(app)
+csrf = CSRFProtect(app)
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    storage_uri=os.getenv("RATELIMIT_STORAGE_URI", "memory://"),
+    default_limits=[]
+)
 
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "pdf"}
+ALLOWED_MIME_TYPES = {
+    "png": {"image/png"},
+    "jpg": {"image/jpeg"},
+    "jpeg": {"image/jpeg"},
+    "webp": {"image/webp"},
+    "pdf": {"application/pdf"},
+}
 
 
 # ============================================================
@@ -81,16 +121,60 @@ def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
+def _valid_file_signature(ext, header):
+    if ext == "png":
+        return header.startswith(b"\x89PNG\r\n\x1a\n")
+    if ext in {"jpg", "jpeg"}:
+        return header.startswith(b"\xff\xd8\xff")
+    if ext == "pdf":
+        return header.startswith(b"%PDF-")
+    if ext == "webp":
+        return len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP"
+    return False
+
+
 def save_upload(file_storage):
     if not file_storage or not file_storage.filename:
         return None
     if not allowed_file(file_storage.filename):
         raise ValueError("Formato no permitido. Usa JPG, PNG, WEBP o PDF.")
+
     original = secure_filename(file_storage.filename)
     ext = original.rsplit(".", 1)[1].lower()
-    filename = f"{datetime.now():%Y%m%d%H%M%S}_{secrets.token_hex(8)}.{ext}"
-    file_storage.save(UPLOAD_DIR / filename)
+    if file_storage.mimetype not in ALLOWED_MIME_TYPES.get(ext, set()):
+        raise ValueError("El tipo real del archivo no coincide con su extensión.")
+
+    header = file_storage.stream.read(16)
+    file_storage.stream.seek(0)
+    if not _valid_file_signature(ext, header):
+        raise ValueError("El contenido del archivo no es válido o fue alterado.")
+
+    filename = f"{datetime.now():%Y%m%d%H%M%S}_{secrets.token_hex(16)}.{ext}"
+    destination = UPLOAD_DIR / filename
+    file_storage.save(destination)
+    try:
+        os.chmod(destination, 0o600)
+    except OSError:
+        pass
     return filename
+
+
+def safe_form_error(exc, fallback="No se pudo completar la operación."):
+    db.session.rollback()
+    if isinstance(exc, (ValueError, InvalidOperation, KeyError)):
+        flash(str(exc), "danger")
+    else:
+        app.logger.exception("Error interno durante una operación", exc_info=exc)
+        flash(fallback, "danger")
+
+
+def validate_text(value, field, max_length, required=False):
+    value = (value or "").strip()
+    if required and not value:
+        raise ValueError(f"{field} es obligatorio.")
+    if len(value) > max_length:
+        raise ValueError(f"{field} supera el tamaño permitido ({max_length} caracteres).")
+    return value
 
 
 def client_balance(client_id):
@@ -173,6 +257,31 @@ class Client(db.Model):
     sales = db.relationship("Sale", backref="client", lazy=True)
     movements = db.relationship("AccountMovement", backref="client", lazy=True, cascade="all, delete-orphan")
     payments = db.relationship("Payment", backref="client", lazy=True, cascade="all, delete-orphan")
+
+
+class AuditLog(db.Model):
+    __tablename__ = "audit_logs"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
+    action = db.Column(db.String(80), nullable=False)
+    entity_type = db.Column(db.String(80), nullable=False)
+    entity_id = db.Column(db.Integer, nullable=True)
+    details = db.Column(db.String(255))
+    ip_address = db.Column(db.String(64))
+    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+
+
+def audit(action, entity_type, entity_id=None, details=None):
+    user = current_user()
+    db.session.add(AuditLog(
+        user_id=user.id if user else None,
+        action=action,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        details=(details or "")[:255],
+        ip_address=(request.remote_addr or "")[:64],
+    ))
 
 
 class Product(db.Model):
@@ -321,6 +430,27 @@ class TandaPayment(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
 
 
+@app.after_request
+def security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "img-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
+        "font-src 'self' https://cdn.jsdelivr.net https://fonts.gstatic.com data:; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+    )
+    if IS_PRODUCTION:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    if request.endpoint not in {"uploaded_file"}:
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
 # ============================================================
 # UI
 # ============================================================
@@ -341,29 +471,38 @@ BASE_TEMPLATE = """
 
   <style>
     :root{
-      --navy:#070d24;
-      --navy-2:#0d1534;
-      --surface:#ffffff;
-      --bg:#f5f7fb;
-      --text:#111827;
-      --muted:#7a8499;
-      --purple:#7047ff;
-      --pink:#ef4ba1;
-      --blue:#1795f5;
-      --green:#15bb75;
-      --orange:#ff9d12;
-      --cyan:#0bcfc7;
-      --danger:#ff4d62;
-      --shadow:0 14px 40px rgba(30,41,59,.08);
-      --radius:22px;
+      --navy:#07101f;
+      --navy-2:#101a32;
+      --surface:rgba(255,255,255,.92);
+      --bg:#f4f7fb;
+      --text:#121829;
+      --muted:#7b8497;
+      --purple:#6d4aff;
+      --purple-2:#8f65ff;
+      --pink:#ff4f9f;
+      --blue:#168df0;
+      --green:#16b97b;
+      --orange:#ff9e18;
+      --cyan:#14c9c4;
+      --danger:#ff4f64;
+      --line:#e9edf5;
+      --shadow:0 18px 50px rgba(21,31,54,.08);
+      --shadow-hover:0 22px 60px rgba(21,31,54,.13);
+      --radius:24px;
     }
 
     *{box-sizing:border-box}
+    html{scroll-behavior:smooth}
     body{
       margin:0;
+      min-height:100vh;
       font-family:'Inter',system-ui,-apple-system,sans-serif;
-      background:var(--bg);
+      background:
+        radial-gradient(circle at 18% 8%, rgba(109,74,255,.07), transparent 25%),
+        radial-gradient(circle at 92% 12%, rgba(255,79,159,.06), transparent 20%),
+        linear-gradient(180deg,#f8faff 0%,#f3f6fb 100%);
       color:var(--text);
+      -webkit-font-smoothing:antialiased;
     }
 
     a{text-decoration:none}
@@ -371,320 +510,502 @@ BASE_TEMPLATE = """
 
     .sidebar{
       position:fixed;
-      top:0;left:0;bottom:0;
-      width:245px;
-      padding:22px 16px;
+      inset:0 auto 0 0;
+      width:258px;
+      padding:20px 14px;
       background:
-        radial-gradient(circle at 20% 10%, rgba(112,71,255,.20), transparent 28%),
-        linear-gradient(180deg,var(--navy),#061027 100%);
-      color:#dbe3ff;
+        radial-gradient(circle at 20% 5%, rgba(109,74,255,.28), transparent 26%),
+        radial-gradient(circle at 100% 82%, rgba(22,141,240,.12), transparent 24%),
+        linear-gradient(180deg,#08101f 0%,#0b1328 55%,#091020 100%);
+      color:#dce5ff;
       overflow-y:auto;
       z-index:1000;
-      border-right:1px solid rgba(255,255,255,.05);
+      border-right:1px solid rgba(255,255,255,.06);
+      box-shadow:18px 0 50px rgba(5,10,24,.08);
     }
+
+    .sidebar::-webkit-scrollbar{width:6px}
+    .sidebar::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:999px}
 
     .brand{
       display:flex;
       align-items:center;
-      gap:12px;
-      padding:4px 8px 22px;
+      gap:13px;
+      padding:5px 8px 24px;
     }
 
     .brand-mark{
-      width:52px;height:52px;
-      border-radius:16px;
+      width:54px;height:54px;
+      border-radius:18px;
       display:grid;place-items:center;
       font-weight:900;
-      font-size:21px;
-      letter-spacing:-2px;
+      font-size:20px;
+      letter-spacing:-1.5px;
       color:#fff;
-      background:
-        linear-gradient(135deg,#ff9a1a 0%,#ff3f87 27%,#7446ff 58%,#169cff 100%);
-      box-shadow:0 10px 30px rgba(112,71,255,.35);
+      background:linear-gradient(135deg,#ffae28 0%,#ff4f9f 30%,#7650ff 62%,#1699f4 100%);
+      box-shadow:0 14px 34px rgba(109,74,255,.38);
       position:relative;
       overflow:hidden;
+      isolation:isolate;
+    }
+
+    .brand-mark::before{
+      content:"";
+      position:absolute;
+      width:48px;height:48px;
+      border:8px solid rgba(255,255,255,.14);
+      border-radius:50%;
+      left:-25px;bottom:-27px;
+      z-index:-1;
     }
 
     .brand-mark::after{
       content:"";
       position:absolute;
-      width:28px;height:28px;
-      border:4px solid rgba(255,255,255,.22);
+      width:30px;height:30px;
+      border:4px solid rgba(255,255,255,.20);
       border-radius:50%;
-      right:-8px;top:-8px;
+      right:-9px;top:-9px;
+      z-index:-1;
     }
 
-    .brand-title{font-weight:900;font-size:20px;letter-spacing:.4px;color:#fff}
-    .brand-sub{font-size:11px;color:#8e9ab9;margin-top:2px}
+    .brand-title{font-weight:900;font-size:20px;letter-spacing:.1px;color:#fff}
+    .brand-sub{font-size:10px;color:#8d9aba;margin-top:3px;letter-spacing:.25px}
 
     .nav-section{
-      font-size:10px;
+      font-size:9px;
       text-transform:uppercase;
-      letter-spacing:1.3px;
-      color:#74809e;
-      margin:20px 12px 8px;
+      letter-spacing:1.6px;
+      color:#687795;
+      margin:20px 13px 9px;
+      font-weight:800;
     }
 
     .side-link{
-      color:#dbe3ff;
-      padding:11px 12px;
+      color:#cfd8ed;
+      padding:12px 13px;
       display:flex;
       align-items:center;
-      gap:11px;
-      border-radius:13px;
-      margin-bottom:4px;
+      gap:12px;
+      border-radius:14px;
+      margin-bottom:5px;
       font-size:13px;
-      font-weight:600;
-      transition:.2s ease;
+      font-weight:650;
+      transition:all .2s ease;
+      border:1px solid transparent;
     }
 
-    .side-link i{font-size:17px;width:22px;text-align:center}
+    .side-link i{
+      font-size:17px;
+      width:22px;
+      text-align:center;
+      opacity:.92;
+    }
+
     .side-link:hover{
       color:#fff;
-      background:rgba(255,255,255,.08);
-      transform:translateX(2px);
+      background:rgba(255,255,255,.065);
+      border-color:rgba(255,255,255,.04);
+      transform:translateX(3px);
     }
+
     .side-link.active{
       color:#fff;
-      background:linear-gradient(135deg,#5c3bff,#7d4cff);
-      box-shadow:0 10px 24px rgba(99,65,255,.35);
+      background:linear-gradient(135deg,rgba(95,60,255,.96),rgba(129,77,255,.96));
+      border-color:rgba(255,255,255,.10);
+      box-shadow:0 12px 30px rgba(92,59,255,.30);
     }
 
     .side-user{
-      margin-top:20px;
+      margin-top:22px;
       padding:14px;
       border-radius:18px;
-      background:rgba(255,255,255,.05);
-      border:1px solid rgba(255,255,255,.06);
+      background:linear-gradient(145deg,rgba(255,255,255,.07),rgba(255,255,255,.035));
+      border:1px solid rgba(255,255,255,.07);
+      backdrop-filter:blur(10px);
     }
 
     .avatar{
       width:42px;height:42px;
       display:grid;place-items:center;
-      border-radius:50%;
-      background:linear-gradient(135deg,#ff9b1a,#ef4ba1,#7047ff);
-      color:white;font-weight:900;
+      border-radius:14px;
+      background:linear-gradient(135deg,#ff9e18,#ef4ba1 48%,#7047ff);
+      color:white;
+      font-weight:900;
+      box-shadow:0 8px 20px rgba(112,71,255,.18);
     }
 
     .main{
-      margin-left:245px;
+      margin-left:258px;
       min-height:100vh;
     }
 
     .topbar{
-      height:76px;
-      background:rgba(255,255,255,.92);
-      backdrop-filter:blur(10px);
-      border-bottom:1px solid #e9edf5;
+      height:78px;
+      background:rgba(255,255,255,.78);
+      backdrop-filter:blur(18px);
+      -webkit-backdrop-filter:blur(18px);
+      border-bottom:1px solid rgba(228,233,242,.82);
       display:flex;
       align-items:center;
       justify-content:space-between;
-      padding:0 28px;
+      padding:0 30px;
       position:sticky;
       top:0;
       z-index:900;
+      box-shadow:0 5px 26px rgba(20,30,55,.035);
     }
 
     .searchbox{
-      width:min(440px,45vw);
+      width:min(470px,45vw);
       position:relative;
     }
+
     .searchbox input{
       width:100%;
-      border:1px solid #e4e9f2;
-      background:#fff;
-      border-radius:14px;
-      padding:12px 44px 12px 16px;
+      border:1px solid #e6eaf1;
+      background:rgba(255,255,255,.88);
+      border-radius:15px;
+      padding:12px 46px 12px 16px;
       outline:none;
       font-size:13px;
-      box-shadow:0 5px 20px rgba(15,23,42,.03);
+      color:#6f798d;
+      box-shadow:0 6px 22px rgba(15,23,42,.035);
     }
+
     .searchbox i{
       position:absolute;
       right:16px;top:50%;
       transform:translateY(-50%);
-      color:#657189;
+      color:#758097;
     }
 
-    .content{padding:28px}
+    .content{
+      padding:30px;
+      max-width:1750px;
+      margin:0 auto;
+    }
 
     .hero-title{
-      font-size:25px;
+      font-size:28px;
       font-weight:900;
-      letter-spacing:-.5px;
-      margin-bottom:4px;
+      letter-spacing:-.8px;
+      margin-bottom:5px;
+      color:#111729;
     }
+
     .hero-sub{color:var(--muted);font-size:13px}
 
     .panel{
-      background:#fff;
-      border:1px solid #edf0f6;
+      background:var(--surface);
+      border:1px solid rgba(231,235,243,.9);
       border-radius:var(--radius);
       box-shadow:var(--shadow);
+      backdrop-filter:blur(10px);
+      transition:box-shadow .22s ease,transform .22s ease,border-color .22s ease;
+    }
+
+    .panel:hover{
+      box-shadow:var(--shadow-hover);
+      border-color:#e1e6f1;
     }
 
     .stat-card{
-      border-radius:20px;
-      padding:20px;
+      border-radius:22px;
+      padding:21px;
       color:#fff;
-      min-height:132px;
+      min-height:138px;
       position:relative;
       overflow:hidden;
-      box-shadow:0 14px 30px rgba(25,32,56,.10);
+      box-shadow:0 16px 34px rgba(25,32,56,.13);
+      isolation:isolate;
+      transition:transform .2s ease,box-shadow .2s ease;
     }
+
+    .stat-card:hover{
+      transform:translateY(-4px);
+      box-shadow:0 22px 44px rgba(25,32,56,.17);
+    }
+
+    .stat-card::before{
+      content:"";
+      position:absolute;
+      width:150px;height:150px;
+      border-radius:50%;
+      background:rgba(255,255,255,.08);
+      right:-42px;top:-54px;
+      z-index:-1;
+    }
+
     .stat-card::after{
       content:"";
       position:absolute;
-      width:115px;height:115px;
+      width:82px;height:82px;
       border-radius:50%;
-      background:rgba(255,255,255,.10);
-      right:-25px;top:-25px;
+      border:16px solid rgba(255,255,255,.08);
+      right:24px;bottom:-47px;
+      z-index:-1;
     }
-    .stat-purple{background:linear-gradient(135deg,#5f3cff,#8749ff)}
-    .stat-green{background:linear-gradient(135deg,#11b667,#26d28c)}
-    .stat-orange{background:linear-gradient(135deg,#ff9a0f,#ffb416)}
-    .stat-blue{background:linear-gradient(135deg,#098be9,#116de7)}
-    .stat-pink{background:linear-gradient(135deg,#e9439e,#f05eb4)}
 
-    .stat-label{font-size:12px;font-weight:600;opacity:.95}
-    .stat-value{font-size:25px;font-weight:900;margin-top:10px;letter-spacing:-.7px}
-    .stat-foot{font-size:11px;margin-top:10px;opacity:.92}
+    .stat-purple{background:linear-gradient(135deg,#6240f6,#8b59ff)}
+    .stat-green{background:linear-gradient(135deg,#0eac6a,#22cf8b)}
+    .stat-orange{background:linear-gradient(135deg,#ff9215,#ffbc25)}
+    .stat-blue{background:linear-gradient(135deg,#0a88e5,#2868ef)}
+    .stat-pink{background:linear-gradient(135deg,#df4198,#f564b6)}
+
+    .stat-label{font-size:11px;font-weight:700;opacity:.92;letter-spacing:.1px}
+    .stat-value{font-size:27px;font-weight:900;margin-top:11px;letter-spacing:-.9px}
+    .stat-foot{font-size:10.5px;margin-top:10px;opacity:.88}
     .stat-icon{
-      position:absolute;right:18px;bottom:18px;
-      width:50px;height:50px;border-radius:50%;
-      background:rgba(255,255,255,.9);
+      position:absolute;
+      right:18px;bottom:18px;
+      width:48px;height:48px;border-radius:15px;
+      background:rgba(255,255,255,.90);
       display:grid;place-items:center;
-      color:#29314c;font-size:23px;
+      color:#29314c;font-size:21px;
       z-index:2;
+      box-shadow:0 9px 22px rgba(0,0,0,.08);
     }
 
-    .section-title{font-size:15px;font-weight:800;margin:0}
-    .section-sub{font-size:12px;color:var(--muted)}
+    .section-title{font-size:15px;font-weight:850;margin:0;letter-spacing:-.15px}
+    .section-sub{font-size:11.5px;color:var(--muted);margin-top:2px}
 
     .quick{
-      min-height:110px;
-      border-radius:18px;
-      padding:16px;
+      min-height:112px;
+      border-radius:20px;
+      padding:17px;
       color:#fff;
-      display:flex;flex-direction:column;
+      display:flex;
+      flex-direction:column;
       justify-content:space-between;
-      font-weight:700;
-      transition:.2s ease;
+      font-weight:800;
+      box-shadow:0 12px 24px rgba(30,40,60,.08);
+      transition:transform .2s ease,box-shadow .2s ease,filter .2s ease;
+      overflow:hidden;
+      position:relative;
     }
-    .quick:hover{transform:translateY(-3px);color:#fff}
-    .quick i{font-size:26px}
+
+    .quick::after{
+      content:"";
+      position:absolute;
+      width:70px;height:70px;
+      right:-20px;top:-20px;
+      border-radius:50%;
+      background:rgba(255,255,255,.12);
+    }
+
+    .quick:hover{
+      transform:translateY(-5px);
+      color:#fff;
+      filter:saturate(1.05);
+      box-shadow:0 18px 34px rgba(30,40,60,.14);
+    }
+
+    .quick i{font-size:27px}
 
     .table{
       --bs-table-bg:transparent;
       margin-bottom:0;
     }
+
     .table thead th{
-      color:#77819a;
-      font-size:11px;
+      color:#818a9e;
+      font-size:10px;
       text-transform:uppercase;
-      letter-spacing:.6px;
-      border-bottom:1px solid #edf0f6;
+      letter-spacing:.75px;
+      border-bottom:1px solid #ebeff5;
       padding:13px 12px;
       white-space:nowrap;
+      font-weight:800;
     }
+
+    .table tbody tr{
+      transition:background .16s ease;
+    }
+
+    .table tbody tr:hover{
+      background:rgba(109,74,255,.028);
+    }
+
     .table tbody td{
       padding:14px 12px;
       border-color:#f0f2f7;
       vertical-align:middle;
-      font-size:13px;
+      font-size:12.5px;
+    }
+
+    .form-label{
+      font-size:12px;
+      color:#4c566d;
     }
 
     .form-control,.form-select{
-      border-radius:13px;
-      padding:11px 13px;
+      border-radius:14px;
+      padding:11.5px 13px;
       border:1px solid #dfe5ef;
       font-size:13px;
+      background:#fbfcfe;
+      transition:border-color .18s ease,box-shadow .18s ease,background .18s ease;
     }
+
+    .form-control:hover,.form-select:hover{background:#fff}
+
     .form-control:focus,.form-select:focus{
+      background:#fff;
       border-color:#8a69ff;
-      box-shadow:0 0 0 .22rem rgba(112,71,255,.12);
+      box-shadow:0 0 0 .22rem rgba(112,71,255,.11);
+    }
+
+    .input-group-text{
+      border-color:#dfe5ef;
+      border-radius:14px 0 0 14px;
+      color:#7b8497;
     }
 
     .btn{
-      border-radius:12px;
-      font-weight:700;
-      font-size:13px;
+      border-radius:13px;
+      font-weight:750;
+      font-size:12.5px;
       padding:10px 15px;
+      transition:all .18s ease;
     }
+
+    .btn:hover{transform:translateY(-1px)}
+
     .btn-gradient{
       color:#fff;
       border:0;
-      background:linear-gradient(135deg,#5f3cff,#8a4fff);
-      box-shadow:0 8px 20px rgba(112,71,255,.24);
-    }
-    .btn-gradient:hover{color:#fff;filter:brightness(1.03)}
-    .badge-soft{
-      background:#f1efff;
-      color:#6c44f5;
-      border-radius:999px;
-      padding:7px 10px;
-      font-weight:700;
+      background:linear-gradient(135deg,#6140f8,#8955ff);
+      box-shadow:0 9px 22px rgba(112,71,255,.25);
     }
 
-    .debt{color:#e23b52;font-weight:800}
-    .credit{color:#0da466;font-weight:800}
+    .btn-gradient:hover{
+      color:#fff;
+      box-shadow:0 12px 27px rgba(112,71,255,.34);
+      filter:brightness(1.03);
+    }
+
+    .badge-soft{
+      background:linear-gradient(135deg,#f2efff,#eef5ff);
+      color:#6842ef;
+      border:1px solid #e5defe;
+      border-radius:999px;
+      padding:7px 11px;
+      font-weight:800;
+      font-size:10.5px;
+    }
+
+    .debt{color:#e43f57;font-weight:850}
+    .credit{color:#0da56a;font-weight:850}
 
     .login-page{
       min-height:100vh;
       background:
-        radial-gradient(circle at 15% 20%, rgba(239,75,161,.18), transparent 25%),
-        radial-gradient(circle at 80% 18%, rgba(23,149,245,.18), transparent 25%),
-        radial-gradient(circle at 70% 80%, rgba(112,71,255,.18), transparent 25%),
-        linear-gradient(135deg,#f8f8ff,#f2f5fb);
+        radial-gradient(circle at 12% 15%, rgba(109,74,255,.15), transparent 26%),
+        radial-gradient(circle at 86% 12%, rgba(255,79,159,.13), transparent 25%),
+        radial-gradient(circle at 75% 85%, rgba(22,141,240,.12), transparent 25%),
+        linear-gradient(135deg,#f7f8fe,#eef3fa);
       display:grid;
       place-items:center;
-      padding:20px;
+      padding:22px;
     }
+
     .login-card{
-      width:min(950px,96vw);
+      width:min(980px,96vw);
       overflow:hidden;
-      border-radius:28px;
-      background:#fff;
-      box-shadow:0 30px 80px rgba(30,41,59,.16);
+      border-radius:30px;
+      background:rgba(255,255,255,.94);
+      box-shadow:0 34px 90px rgba(30,41,59,.17);
       display:grid;
       grid-template-columns:1.05fr .95fr;
+      border:1px solid rgba(255,255,255,.8);
     }
+
     .login-brand{
-      min-height:570px;
-      padding:54px;
+      min-height:590px;
+      padding:56px;
       color:#fff;
       background:
-        radial-gradient(circle at 80% 15%, rgba(255,255,255,.16), transparent 22%),
-        linear-gradient(145deg,#081127,#121a3d 52%,#2b1a70);
+        radial-gradient(circle at 76% 13%, rgba(255,255,255,.14), transparent 23%),
+        radial-gradient(circle at 18% 88%, rgba(23,149,245,.12), transparent 25%),
+        linear-gradient(145deg,#07101f,#121b3b 56%,#2b1a70);
       display:flex;
       flex-direction:column;
       justify-content:space-between;
+      position:relative;
+      overflow:hidden;
     }
-    .login-form{padding:56px}
+
+    .login-brand::after{
+      content:"";
+      position:absolute;
+      width:260px;height:260px;
+      border:45px solid rgba(255,255,255,.035);
+      border-radius:50%;
+      right:-110px;bottom:-100px;
+    }
+
+    .login-form{
+      padding:60px 56px;
+      align-self:center;
+    }
+
     .login-logo{
-      width:92px;height:92px;border-radius:27px;
+      width:94px;height:94px;border-radius:28px;
       display:grid;place-items:center;
-      font-size:35px;font-weight:900;letter-spacing:-4px;
-      background:linear-gradient(135deg,#ff9a1a,#ff3f87,#7446ff,#169cff);
-      box-shadow:0 20px 45px rgba(112,71,255,.35);
+      font-size:34px;font-weight:900;letter-spacing:-3px;
+      background:linear-gradient(135deg,#ffae28,#ff4f9f 36%,#7650ff 67%,#1699f4);
+      box-shadow:0 22px 50px rgba(112,71,255,.38);
     }
 
-    .progress-thin{height:7px;border-radius:999px;background:#eef1f7;overflow:hidden}
-    .progress-thin span{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#5f3cff,#169cff)}
+    .progress-thin{
+      height:7px;border-radius:999px;background:#edf1f7;overflow:hidden;
+    }
 
-    @media (max-width: 991px){
-      .sidebar{transform:translateX(-100%);transition:.25s}
+    .progress-thin span{
+      display:block;height:100%;border-radius:999px;
+      background:linear-gradient(90deg,#6542fb,#168df0);
+    }
+
+    .alert{
+      border-radius:16px;
+      border:1px solid rgba(0,0,0,.035);
+      box-shadow:0 10px 30px rgba(30,41,59,.06);
+      font-size:13px;
+    }
+
+    @media (max-width:1199px){
+      .content{padding:25px}
+      .stat-value{font-size:24px}
+    }
+
+    @media (max-width:991px){
+      .sidebar{
+        transform:translateX(-100%);
+        transition:transform .25s ease;
+        box-shadow:20px 0 60px rgba(5,10,24,.25);
+      }
       .sidebar.show{transform:translateX(0)}
       .main{margin-left:0}
-      .topbar{padding:0 15px}
-      .content{padding:18px 14px}
-      .searchbox{width:65vw}
+      .topbar{padding:0 16px}
+      .content{padding:20px 14px}
+      .hero-title{font-size:24px}
+      .searchbox{width:64vw}
       .login-card{grid-template-columns:1fr}
       .login-brand{display:none}
-      .login-form{padding:36px 26px}
+      .login-form{padding:42px 30px}
     }
 
-    .alert{border-radius:16px;border:0;box-shadow:0 10px 30px rgba(30,41,59,.07)}
+    @media (max-width:575px){
+      .topbar{height:68px}
+      .content{padding:16px 11px}
+      .panel{border-radius:20px}
+      .stat-card{min-height:126px;border-radius:19px}
+      .quick{min-height:100px}
+      .login-page{padding:12px}
+      .login-card{border-radius:24px}
+      .login-form{padding:34px 22px}
+    }
   </style>
 </head>
 <body>
@@ -725,9 +1046,15 @@ BASE_TEMPLATE = """
     </a>
 
     <div class="nav-section">Administración</div>
-    <a class="side-link" href="{{ url_for('logout') }}">
-      <i class="bi bi-box-arrow-left"></i> Cerrar sesión
+    <a class="side-link {{ 'active' if active=='account' else '' }}" href="{{ url_for('change_password') }}">
+      <i class="bi bi-key"></i> Cambiar contraseña
     </a>
+    <form method="post" action="{{ url_for('logout') }}" class="m-0">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="side-link w-100 border-0 bg-transparent text-start" type="submit">
+        <i class="bi bi-box-arrow-left"></i> Cerrar sesión
+      </button>
+    </form>
 
     <div class="side-user">
       <div class="d-flex align-items-center gap-3">
@@ -797,6 +1124,7 @@ def page(content, title="YM Store", active="", **context):
 # ============================================================
 
 @app.route("/login", methods=["GET", "POST"])
+@limiter.limit("5 per minute")
 def login():
     if current_user():
         return redirect(url_for("dashboard"))
@@ -808,7 +1136,10 @@ def login():
 
         if user and user.check_password(password):
             session.clear()
+            session.permanent = True
             session["user_id"] = user.id
+            audit("LOGIN_OK", "USER", user.id)
+            db.session.commit()
             flash(f"Bienvenida, {user.name}.", "success")
             return redirect(url_for("dashboard"))
 
@@ -848,6 +1179,7 @@ def login():
           {% endwith %}
 
           <form method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <label class="form-label fw-bold">Usuario</label>
             <div class="input-group mb-3">
               <span class="input-group-text bg-white border-end-0"><i class="bi bi-person"></i></span>
@@ -874,10 +1206,59 @@ def login():
     """, title="Iniciar sesión")
 
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
+@login_required
 def logout():
+    audit("LOGOUT", "USER", session.get("user_id"))
+    db.session.commit()
     session.clear()
     return redirect(url_for("login"))
+
+
+@app.route("/cuenta/cambiar-password", methods=["GET", "POST"])
+@admin_required
+@limiter.limit("10 per hour")
+def change_password():
+    user = current_user()
+    if request.method == "POST":
+        current_password = request.form.get("current_password", "")
+        new_password = request.form.get("new_password", "")
+        confirm_password = request.form.get("confirm_password", "")
+
+        if not user.check_password(current_password):
+            flash("La contraseña actual no es correcta.", "danger")
+        elif len(new_password) < 12:
+            flash("La nueva contraseña debe tener al menos 12 caracteres.", "danger")
+        elif new_password != confirm_password:
+            flash("La confirmación no coincide.", "danger")
+        elif new_password == current_password:
+            flash("La nueva contraseña debe ser diferente a la actual.", "danger")
+        else:
+            user.set_password(new_password)
+            audit("PASSWORD_CHANGE", "USER", user.id)
+            db.session.commit()
+            session.clear()
+            flash("Contraseña actualizada. Inicia sesión nuevamente.", "success")
+            return redirect(url_for("login"))
+
+    return page("""
+    <div class="mb-4">
+      <div class="hero-title">Cambiar contraseña</div>
+      <div class="hero-sub">Usa una contraseña única de al menos 12 caracteres.</div>
+    </div>
+    <div class="panel p-4" style="max-width:620px">
+      <form method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label class="form-label fw-bold">Contraseña actual</label>
+        <input class="form-control mb-3" type="password" name="current_password" autocomplete="current-password" required>
+        <label class="form-label fw-bold">Nueva contraseña</label>
+        <input class="form-control mb-3" type="password" name="new_password" autocomplete="new-password" minlength="12" required>
+        <label class="form-label fw-bold">Confirmar nueva contraseña</label>
+        <input class="form-control mb-4" type="password" name="confirm_password" autocomplete="new-password" minlength="12" required>
+        <button class="btn btn-gradient">Actualizar contraseña</button>
+      </form>
+    </div>
+    """, title="Cambiar contraseña", active="account")
 
 
 # ============================================================
@@ -885,7 +1266,7 @@ def logout():
 # ============================================================
 
 @app.route("/")
-@login_required
+@admin_required
 def dashboard():
     total_clients = Client.query.filter_by(active=True).count()
     total_products = Product.query.filter_by(active=True).count()
@@ -1089,30 +1470,33 @@ def dashboard():
 # ============================================================
 
 @app.route("/clientes", methods=["GET", "POST"])
-@login_required
+@admin_required
 def clients():
     if request.method == "POST":
         try:
-            name = request.form.get("name", "").strip()
-            if not name:
-                raise ValueError("El nombre es obligatorio.")
+            name = validate_text(request.form.get("name"), "Nombre", 150, required=True)
+            phone = validate_text(request.form.get("phone"), "Teléfono", 30)
+            email = validate_text(request.form.get("email"), "Correo", 150)
+            address = validate_text(request.form.get("address"), "Dirección", 300)
+            notes = validate_text(request.form.get("notes"), "Notas", 2000)
 
             client = Client(
                 name=name,
-                phone=request.form.get("phone", "").strip(),
-                email=request.form.get("email", "").strip(),
-                address=request.form.get("address", "").strip(),
-                notes=request.form.get("notes", "").strip()
+                phone=phone,
+                email=email,
+                address=address,
+                notes=notes
             )
             db.session.add(client)
+            db.session.flush()
+            audit("CLIENT_CREATE", "CLIENT", client.id)
             db.session.commit()
             flash("Cliente creado correctamente.", "success")
             return redirect(url_for("client_detail", client_id=client.id))
         except Exception as e:
-            db.session.rollback()
-            flash(str(e), "danger")
+            safe_form_error(e)
 
-    q = request.args.get("q", "").strip()
+    q = request.args.get("q", "").strip()[:100]
     query = Client.query.filter_by(active=True)
     if q:
         query = query.filter(Client.name.ilike(f"%{q}%"))
@@ -1135,6 +1519,7 @@ def clients():
             <div><h2 class="section-title">Nuevo cliente</h2><div class="section-sub">Agrega sus datos principales</div></div>
           </div>
           <form method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <label class="form-label fw-bold">Nombre</label>
             <input class="form-control mb-3" name="name" required>
             <label class="form-label fw-bold">Teléfono</label>
@@ -1190,7 +1575,7 @@ def clients():
 
 
 @app.route("/clientes/<int:client_id>", methods=["GET", "POST"])
-@login_required
+@admin_required
 def client_detail(client_id):
     client = db.session.get(Client, client_id)
     if not client:
@@ -1203,28 +1588,38 @@ def client_detail(client_id):
             if amount <= 0:
                 raise ValueError("El monto debe ser mayor a cero.")
 
+            concept = validate_text(request.form.get("concept"), "Concepto", 255)
+
             if action == "charge":
                 create_account_movement(
                     client.id,
                     "CARGO",
-                    request.form.get("concept", "").strip() or "Cargo manual",
+                    concept or "Cargo manual",
                     charge=amount
                 )
+                audit("ACCOUNT_CHARGE", "CLIENT", client.id, f"amount={amount}")
                 flash("Cargo agregado.", "success")
 
             elif action == "payment":
+                balance_now = client_balance(client.id)
+                if balance_now <= 0:
+                    raise ValueError("El cliente no tiene deuda pendiente.")
+                if amount > balance_now:
+                    raise ValueError(f"El abono no puede superar el saldo pendiente ({money(balance_now)}).")
                 create_account_movement(
                     client.id,
                     "ABONO",
-                    request.form.get("concept", "").strip() or "Abono manual",
+                    concept or "Abono manual",
                     credit=amount
                 )
+                audit("ACCOUNT_PAYMENT", "CLIENT", client.id, f"amount={amount}")
                 flash("Abono registrado.", "success")
+            else:
+                raise ValueError("Acción no válida.")
 
             db.session.commit()
         except Exception as e:
-            db.session.rollback()
-            flash(str(e), "danger")
+            safe_form_error(e)
 
         return redirect(url_for("client_detail", client_id=client.id))
 
@@ -1264,6 +1659,7 @@ def client_detail(client_id):
         <div class="panel p-4 mb-4">
           <h2 class="section-title mb-3 text-danger"><i class="bi bi-plus-circle me-1"></i> Aumentar deuda</h2>
           <form method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input type="hidden" name="action" value="charge">
             <input class="form-control mb-3" type="number" step="0.01" min="0.01" name="amount" placeholder="Monto" required>
             <input class="form-control mb-3" name="concept" placeholder="Concepto">
@@ -1274,6 +1670,7 @@ def client_detail(client_id):
         <div class="panel p-4">
           <h2 class="section-title mb-3 text-success"><i class="bi bi-dash-circle me-1"></i> Reducir deuda</h2>
           <form method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input type="hidden" name="action" value="payment">
             <input class="form-control mb-3" type="number" step="0.01" min="0.01" name="amount" placeholder="Monto" required>
             <input class="form-control mb-3" name="concept" placeholder="Concepto">
@@ -1327,9 +1724,11 @@ def client_detail(client_id):
                       {% endif %}
                       {% if p.status == 'PENDIENTE' %}
                         <form method="post" action="{{ url_for('approve_payment', payment_id=p.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                           <button class="btn btn-sm btn-success">Aprobar</button>
                         </form>
                         <form method="post" action="{{ url_for('reject_payment', payment_id=p.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                           <button class="btn btn-sm btn-danger">Rechazar</button>
                         </form>
                       {% endif %}
@@ -1350,7 +1749,7 @@ def client_detail(client_id):
 
 
 @app.route("/pagos")
-@login_required
+@admin_required
 def payments_admin():
     rows = Payment.query.order_by(Payment.created_at.desc()).all()
     return page("""
@@ -1391,22 +1790,31 @@ def payments_admin():
 
 
 @app.route("/pago/<token>", methods=["GET", "POST"])
+@limiter.limit("30 per hour")
 def public_payment(token):
     client = Client.query.filter_by(payment_token=token, active=True).first_or_404()
 
     if request.method == "POST":
         try:
             amount = Decimal(request.form.get("amount", "0"))
+            balance_now = client_balance(client.id)
             if amount <= 0:
                 raise ValueError("El monto debe ser mayor a cero.")
+            if balance_now <= 0:
+                raise ValueError("Esta cuenta no tiene saldo pendiente.")
+            if amount > balance_now:
+                raise ValueError(f"El monto no puede superar el saldo pendiente ({money(balance_now)}).")
 
+            reference = validate_text(request.form.get("reference"), "Referencia", 150)
             receipt = request.files.get("receipt")
-            filename = save_upload(receipt) if receipt and receipt.filename else None
+            if not receipt or not receipt.filename:
+                raise ValueError("Debes adjuntar un comprobante.")
+            filename = save_upload(receipt)
 
             payment = Payment(
                 client_id=client.id,
                 amount=amount,
-                reference=request.form.get("reference", "").strip(),
+                reference=reference,
                 receipt_file=filename,
                 status="PENDIENTE"
             )
@@ -1416,8 +1824,7 @@ def public_payment(token):
             return redirect(url_for("public_payment", token=token))
 
         except Exception as e:
-            db.session.rollback()
-            flash(str(e), "danger")
+            safe_form_error(e)
 
     balance = client_balance(client.id)
 
@@ -1446,6 +1853,7 @@ def public_payment(token):
         </div>
 
         <form method="post" enctype="multipart/form-data">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <label class="form-label fw-bold">Cantidad pagada</label>
           <input class="form-control mb-3" type="number" step="0.01" min="0.01" name="amount" required>
 
@@ -1465,12 +1873,23 @@ def public_payment(token):
 @app.route("/pagos/<int:payment_id>/aprobar", methods=["POST"])
 @admin_required
 def approve_payment(payment_id):
-    payment = db.session.get(Payment, payment_id)
+    payment = db.session.query(Payment).filter_by(id=payment_id).with_for_update().first()
     if not payment:
         abort(404)
 
     if payment.status != "PENDIENTE":
         flash("Este pago ya fue procesado.", "warning")
+        return redirect(url_for("client_detail", client_id=payment.client_id))
+
+    balance_now = client_balance(payment.client_id)
+    if balance_now <= 0:
+        payment.status = "RECHAZADO"
+        audit("PAYMENT_AUTO_REJECT", "PAYMENT", payment.id, "no outstanding balance")
+        db.session.commit()
+        flash("El pago fue rechazado porque la cuenta ya no tiene deuda.", "warning")
+        return redirect(url_for("client_detail", client_id=payment.client_id))
+    if Decimal(payment.amount) > balance_now:
+        flash(f"No se aprobó: el comprobante supera el saldo actual ({money(balance_now)}).", "warning")
         return redirect(url_for("client_detail", client_id=payment.client_id))
 
     create_account_movement(
@@ -1482,6 +1901,7 @@ def approve_payment(payment_id):
     )
     payment.status = "APROBADO"
     payment.approved_at = datetime.now()
+    audit("PAYMENT_APPROVE", "PAYMENT", payment.id, f"amount={payment.amount}")
     db.session.commit()
 
     flash("Pago aprobado y deuda actualizada.", "success")
@@ -1497,6 +1917,7 @@ def reject_payment(payment_id):
 
     if payment.status == "PENDIENTE":
         payment.status = "RECHAZADO"
+        audit("PAYMENT_REJECT", "PAYMENT", payment.id, f"amount={payment.amount}")
         db.session.commit()
 
     flash("Pago rechazado.", "warning")
@@ -1504,9 +1925,9 @@ def reject_payment(payment_id):
 
 
 @app.route("/uploads/<path:filename>")
-@login_required
+@admin_required
 def uploaded_file(filename):
-    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+    return send_from_directory(app.config["UPLOAD_FOLDER"], filename, as_attachment=True)
 
 
 # ============================================================
@@ -1514,20 +1935,18 @@ def uploaded_file(filename):
 # ============================================================
 
 @app.route("/productos", methods=["GET", "POST"])
-@login_required
+@admin_required
 def products():
     if request.method == "POST":
         try:
-            sku = request.form.get("sku", "").strip().upper()
-            name = request.form.get("name", "").strip()
-
-            if not sku or not name:
-                raise ValueError("SKU y nombre son obligatorios.")
+            sku = validate_text(request.form.get("sku"), "SKU", 60, required=True).upper()
+            name = validate_text(request.form.get("name"), "Nombre", 150, required=True)
+            description = validate_text(request.form.get("description"), "Descripción", 2000)
 
             product = Product(
                 sku=sku,
                 name=name,
-                description=request.form.get("description", "").strip(),
+                description=description,
                 purchase_price=Decimal(request.form.get("purchase_price", "0")),
                 sale_price=Decimal(request.form.get("sale_price", "0")),
                 stock=int(request.form.get("stock", 0)),
@@ -1539,13 +1958,13 @@ def products():
             if product.stock:
                 add_inventory_movement(product, "ALTA_INICIAL", product.stock, reference="ALTA")
 
+            audit("PRODUCT_CREATE", "PRODUCT", product.id, f"stock={product.stock}")
             db.session.commit()
             flash("Producto creado.", "success")
             return redirect(url_for("products"))
 
         except Exception as e:
-            db.session.rollback()
-            flash(f"No se pudo crear el producto: {e}", "danger")
+            safe_form_error(e, "No se pudo crear el producto.")
 
     rows = Product.query.filter_by(active=True).order_by(Product.name).all()
 
@@ -1564,6 +1983,7 @@ def products():
           </div>
 
           <form method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input class="form-control mb-3" name="sku" placeholder="SKU / Código" required>
             <input class="form-control mb-3" name="name" placeholder="Nombre del producto" required>
             <textarea class="form-control mb-3" name="description" placeholder="Descripción"></textarea>
@@ -1599,6 +2019,7 @@ def products():
                   <td><span class="badge rounded-pill text-bg-{{ 'danger' if p.stock <= p.minimum_stock else 'success' }}">{{ p.stock }}</span></td>
                   <td>
                     <form class="d-flex gap-1" method="post" action="{{ url_for('adjust_stock', product_id=p.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                       <input class="form-control form-control-sm" style="width:80px" type="number" name="quantity" required placeholder="+/-">
                       <button class="btn btn-sm btn-light"><i class="bi bi-check-lg"></i></button>
                     </form>
@@ -1617,7 +2038,7 @@ def products():
 
 
 @app.route("/productos/<int:product_id>/ajustar", methods=["POST"])
-@login_required
+@admin_required
 def adjust_stock(product_id):
     product = db.session.get(Product, product_id)
     if not product:
@@ -1637,11 +2058,11 @@ def adjust_stock(product_id):
             qty,
             reference="AJUSTE_MANUAL"
         )
+        audit("STOCK_ADJUST", "PRODUCT", product.id, f"delta={qty}; new_stock={product.stock}")
         db.session.commit()
         flash("Stock actualizado.", "success")
     except Exception as e:
-        db.session.rollback()
-        flash(str(e), "danger")
+        safe_form_error(e)
 
     return redirect(url_for("products"))
 
@@ -1651,16 +2072,16 @@ def adjust_stock(product_id):
 # ============================================================
 
 @app.route("/compras", methods=["GET", "POST"])
-@login_required
+@admin_required
 def purchases():
     products_list = Product.query.filter_by(active=True).order_by(Product.name).all()
 
     if request.method == "POST":
         try:
-            product = db.session.get(Product, int(request.form["product_id"]))
+            product = db.session.query(Product).filter_by(id=int(request.form["product_id"])).with_for_update().first()
             qty = int(request.form["quantity"])
             cost = Decimal(request.form["unit_cost"])
-            supplier = request.form.get("supplier", "").strip() or "Proveedor"
+            supplier = validate_text(request.form.get("supplier"), "Proveedor", 150) or "Proveedor"
 
             if not product or qty <= 0 or cost < 0:
                 raise ValueError("Datos de compra inválidos.")
@@ -1681,14 +2102,14 @@ def purchases():
             product.stock += qty
             product.purchase_price = cost
             add_inventory_movement(product, "COMPRA", qty, reference=f"COMPRA-{purchase.id}")
+            audit("PURCHASE_CREATE", "PURCHASE", purchase.id, f"product={product.id}; qty={qty}; total={total}")
 
             db.session.commit()
             flash("Compra registrada y stock aumentado.", "success")
             return redirect(url_for("purchases"))
 
         except Exception as e:
-            db.session.rollback()
-            flash(str(e), "danger")
+            safe_form_error(e)
 
     rows = Purchase.query.order_by(Purchase.created_at.desc()).limit(100).all()
 
@@ -1706,6 +2127,7 @@ def purchases():
             <div><h2 class="section-title">Nueva compra</h2><div class="section-sub">Aumenta stock automáticamente</div></div>
           </div>
           <form method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input class="form-control mb-3" name="supplier" placeholder="Proveedor">
             <select class="form-select mb-3" name="product_id" required>
               <option value="">Selecciona producto...</option>
@@ -1744,7 +2166,7 @@ def purchases():
 # ============================================================
 
 @app.route("/ventas", methods=["GET", "POST"])
-@login_required
+@admin_required
 def sales():
     clients_list = Client.query.filter_by(active=True).order_by(Client.name).all()
     products_list = Product.query.filter_by(active=True).order_by(Product.name).all()
@@ -1752,7 +2174,7 @@ def sales():
     if request.method == "POST":
         try:
             client = db.session.get(Client, int(request.form["client_id"]))
-            product = db.session.get(Product, int(request.form["product_id"]))
+            product = db.session.query(Product).filter_by(id=int(request.form["product_id"])).with_for_update().first()
             qty = int(request.form["quantity"])
             price = Decimal(request.form.get("unit_price") or product.sale_price)
             paid_now = Decimal(request.form.get("paid_now") or 0)
@@ -1807,13 +2229,13 @@ def sales():
                     reference=f"VENTA-{sale.id}"
                 )
 
+            audit("SALE_CREATE", "SALE", sale.id, f"client={client.id}; product={product.id}; qty={qty}; total={total}")
             db.session.commit()
             flash("Venta registrada. Inventario y deuda actualizados.", "success")
             return redirect(url_for("sales"))
 
         except Exception as e:
-            db.session.rollback()
-            flash(str(e), "danger")
+            safe_form_error(e)
 
     rows = Sale.query.order_by(Sale.created_at.desc()).limit(100).all()
 
@@ -1831,6 +2253,7 @@ def sales():
             <div><h2 class="section-title">Nueva venta</h2><div class="section-sub">Venta rápida a cliente</div></div>
           </div>
           <form method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <select class="form-select mb-3" name="client_id" required>
               <option value="">Cliente...</option>
               {% for c in clients_list %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
@@ -1880,27 +2303,31 @@ def sales():
 # ============================================================
 
 @app.route("/tandas", methods=["GET", "POST"])
-@login_required
+@admin_required
 def tandas():
     if request.method == "POST":
         try:
+            frequency = request.form.get("frequency", "SEMANAL").upper()
+            if frequency not in {"SEMANAL", "QUINCENAL", "MENSUAL"}:
+                raise ValueError("Frecuencia de tanda inválida.")
             tanda = Tanda(
-                name=request.form.get("name", "").strip(),
+                name=validate_text(request.form.get("name"), "Nombre de tanda", 150, required=True),
                 amount=Decimal(request.form.get("amount", "0")),
                 payment_amount=Decimal(request.form.get("payment_amount", "0")),
-                frequency=request.form.get("frequency", "SEMANAL"),
+                frequency=frequency,
                 start_date=datetime.strptime(request.form.get("start_date"), "%Y-%m-%d").date()
             )
-            if not tanda.name or tanda.amount <= 0 or tanda.payment_amount <= 0:
-                raise ValueError("Datos de tanda inválidos.")
+            if tanda.amount <= 0 or tanda.payment_amount <= 0:
+                raise ValueError("Los montos de la tanda deben ser mayores a cero.")
 
             db.session.add(tanda)
+            db.session.flush()
+            audit("TANDA_CREATE", "TANDA", tanda.id, f"amount={tanda.amount}")
             db.session.commit()
             flash("Tanda creada.", "success")
             return redirect(url_for("tanda_detail", tanda_id=tanda.id))
         except Exception as e:
-            db.session.rollback()
-            flash(str(e), "danger")
+            safe_form_error(e)
 
     rows = Tanda.query.order_by(Tanda.created_at.desc()).all()
 
@@ -1918,6 +2345,7 @@ def tandas():
             <div><h2 class="section-title">Nueva tanda</h2><div class="section-sub">Crea un nuevo grupo</div></div>
           </div>
           <form method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input class="form-control mb-3" name="name" placeholder="Nombre de la tanda" required>
             <input class="form-control mb-3" type="number" step="0.01" min="0.01" name="amount" placeholder="Monto total" required>
             <input class="form-control mb-3" type="number" step="0.01" min="0.01" name="payment_amount" placeholder="Pago periódico" required>
@@ -1959,7 +2387,7 @@ def tandas():
 
 
 @app.route("/tandas/<int:tanda_id>", methods=["GET", "POST"])
-@login_required
+@admin_required
 def tanda_detail(tanda_id):
     tanda = db.session.get(Tanda, tanda_id)
     if not tanda:
@@ -1974,21 +2402,35 @@ def tanda_detail(tanda_id):
                 turn = int(request.form["turn_number"])
                 total_due = Decimal(request.form.get("total_due") or tanda.amount)
 
+                if total_due <= 0 or turn <= 0:
+                    raise ValueError("Turno y monto deben ser mayores a cero.")
                 exists = TandaParticipant.query.filter_by(
                     tanda_id=tanda.id,
                     client_id=client_id
                 ).first()
                 if exists:
                     raise ValueError("El cliente ya participa en esta tanda.")
+                if TandaParticipant.query.filter_by(tanda_id=tanda.id, turn_number=turn).first():
+                    raise ValueError("Ese turno ya está ocupado en la tanda.")
 
-                db.session.add(TandaParticipant(
+                participant = TandaParticipant(
                     tanda_id=tanda.id,
                     client_id=client_id,
                     turn_number=turn,
                     total_due=total_due
-                ))
+                )
+                db.session.add(participant)
+                db.session.flush()
+                create_account_movement(
+                    client_id,
+                    "CARGO",
+                    f"Tanda {tanda.name}",
+                    charge=total_due,
+                    reference=f"TANDA-{tanda.id}-PART-{participant.id}"
+                )
+                audit("TANDA_PARTICIPANT_ADD", "TANDA_PARTICIPANT", participant.id, f"tanda={tanda.id}; client={client_id}; due={total_due}")
                 db.session.commit()
-                flash("Participante agregado.", "success")
+                flash("Participante agregado y deuda de tanda registrada.", "success")
 
             elif action == "payment":
                 participant = db.session.get(
@@ -2001,17 +2443,23 @@ def tanda_detail(tanda_id):
                     raise ValueError("Participante inválido.")
                 if amount <= 0:
                     raise ValueError("Monto inválido.")
+                remaining = Decimal(participant.total_due or 0) - Decimal(participant.paid or 0)
+                if remaining <= 0:
+                    raise ValueError("Esta participación ya está pagada.")
+                if amount > remaining:
+                    raise ValueError(f"El pago no puede superar el pendiente ({money(remaining)}).")
 
                 filename = None
                 receipt = request.files.get("receipt")
                 if receipt and receipt.filename:
                     filename = save_upload(receipt)
+                notes = validate_text(request.form.get("notes"), "Notas", 255)
 
                 db.session.add(TandaPayment(
                     participant_id=participant.id,
                     amount=amount,
                     receipt_file=filename,
-                    notes=request.form.get("notes", "").strip()
+                    notes=notes
                 ))
 
                 participant.paid = Decimal(participant.paid or 0) + amount
@@ -2022,15 +2470,15 @@ def tanda_detail(tanda_id):
                     "ABONO",
                     f"Pago tanda {tanda.name}",
                     credit=amount,
-                    reference=f"TANDA-{tanda.id}"
+                    reference=f"TANDA-{tanda.id}-PART-{participant.id}"
                 )
+                audit("TANDA_PAYMENT", "TANDA_PARTICIPANT", participant.id, f"amount={amount}")
 
                 db.session.commit()
                 flash("Pago de tanda registrado.", "success")
 
         except Exception as e:
-            db.session.rollback()
-            flash(str(e), "danger")
+            safe_form_error(e)
 
         return redirect(url_for("tanda_detail", tanda_id=tanda.id))
 
@@ -2056,6 +2504,7 @@ def tanda_detail(tanda_id):
         <div class="panel p-4 mb-4">
           <h2 class="section-title mb-3">Agregar participante</h2>
           <form method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input type="hidden" name="action" value="add_participant">
             <select class="form-select mb-3" name="client_id" required>
               <option value="">Cliente...</option>
@@ -2070,6 +2519,7 @@ def tanda_detail(tanda_id):
         <div class="panel p-4">
           <h2 class="section-title mb-3">Registrar pago</h2>
           <form method="post" enctype="multipart/form-data">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input type="hidden" name="action" value="payment">
             <select class="form-select mb-3" name="participant_id" required>
               <option value="">Participante...</option>
@@ -2117,18 +2567,29 @@ def tanda_detail(tanda_id):
 # ============================================================
 
 def create_default_admin():
-    if not User.query.filter_by(username="admin").first():
-        admin = User(
-            name=os.getenv("ADMIN_NAME", "Yajaira Moreno"),
-            username="admin",
-            role="ADMIN"
-        )
-        admin.set_password(os.getenv("ADMIN_PASSWORD", "Admin1234!"))
-        db.session.add(admin)
-        db.session.commit()
-        print("Usuario inicial creado: admin")
-        print("Contraseña inicial: Admin1234!")
-        print("IMPORTANTE: cámbiala antes de publicar la aplicación.")
+    if User.query.filter_by(username="admin").first():
+        return
+
+    configured_password = os.getenv("ADMIN_PASSWORD")
+    if IS_PRODUCTION and not configured_password:
+        raise RuntimeError("ADMIN_PASSWORD es obligatoria la primera vez que se inicia producción.")
+
+    generated_password = configured_password or secrets.token_urlsafe(18)
+    if len(generated_password) < 12:
+        raise RuntimeError("ADMIN_PASSWORD debe tener al menos 12 caracteres.")
+
+    admin = User(
+        name=os.getenv("ADMIN_NAME", "Yajaira Moreno"),
+        username=os.getenv("ADMIN_USERNAME", "admin").strip().lower(),
+        role="ADMIN"
+    )
+    admin.set_password(generated_password)
+    db.session.add(admin)
+    db.session.commit()
+    print(f"Usuario inicial creado: {admin.username}")
+    if not configured_password:
+        print(f"Contraseña local generada (guárdala ahora): {generated_password}")
+    print("Cambia la contraseña desde el panel antes de exponer datos reales.")
 
 
 @app.errorhandler(403)
@@ -2166,7 +2627,7 @@ with app.app_context():
 
 if __name__ == "__main__":
     app.run(
-        host=os.getenv("HOST", "127.0.0.1"),
+        host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", 5000)),
-        debug=os.getenv("FLASK_DEBUG", "1") == "1"
+        debug=(not IS_PRODUCTION and os.getenv("FLASK_DEBUG", "0") == "1")
     )

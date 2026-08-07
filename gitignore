@@ -3,8 +3,11 @@ venv/
 __pycache__/
 *.pyc
 .env
+*.db
 ym_store.db
 uploads/
-.idea/
+instance/
+*.log
 .vscode/
+.idea/
 .DS_Store
