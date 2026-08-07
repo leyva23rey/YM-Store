@@ -1,5 +1,6 @@
 import os
 import secrets
+from io import BytesIO
 from datetime import datetime, date, timedelta
 from decimal import Decimal, InvalidOperation
 from functools import wraps
@@ -7,7 +8,7 @@ from pathlib import Path
 
 from flask import (
     Flask, request, redirect, url_for, flash, session,
-    send_from_directory, abort, render_template_string
+    send_from_directory, send_file, abort, render_template_string
 )
 from flask_sqlalchemy import SQLAlchemy
 from flask_wtf.csrf import CSRFProtect
@@ -117,6 +118,35 @@ def admin_required(view):
     return wrapped
 
 
+def get_customer_profile():
+    user = current_user()
+    if not user or user.role != "CLIENTE":
+        return None
+    return CustomerProfile.query.filter_by(user_id=user.id).first()
+
+
+def customer_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        user = current_user()
+        if not user:
+            flash("Inicia sesión para continuar.", "warning")
+            return redirect(url_for("login"))
+        if user.role != "CLIENTE":
+            abort(403)
+        if not get_customer_profile():
+            abort(403)
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def user_home_url(user=None):
+    user = user or current_user()
+    if not user:
+        return url_for("store")
+    return url_for("dashboard") if user.role == "ADMIN" else url_for("customer_home")
+
+
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
@@ -157,6 +187,71 @@ def save_upload(file_storage):
     except OSError:
         pass
     return filename
+
+
+def product_image_payload(file_storage):
+    """Valida una imagen de catálogo y devuelve bytes seguros para PostgreSQL."""
+    if not file_storage or not file_storage.filename:
+        return None
+
+    original = secure_filename(file_storage.filename)
+    if "." not in original:
+        raise ValueError("La imagen necesita una extensión válida.")
+
+    ext = original.rsplit(".", 1)[1].lower()
+    if ext not in {"png", "jpg", "jpeg", "webp"}:
+        raise ValueError("La foto del producto debe ser JPG, PNG o WEBP.")
+
+    allowed_mimes = {
+        "png": {"image/png"},
+        "jpg": {"image/jpeg"},
+        "jpeg": {"image/jpeg"},
+        "webp": {"image/webp"},
+    }
+    if file_storage.mimetype not in allowed_mimes[ext]:
+        raise ValueError("El tipo de la imagen no coincide con su extensión.")
+
+    data = file_storage.read(3 * 1024 * 1024 + 1)
+    file_storage.stream.seek(0)
+    if len(data) > 3 * 1024 * 1024:
+        raise ValueError("La foto del producto no puede superar 3 MB.")
+
+    if not _valid_file_signature(ext, data[:16]):
+        raise ValueError("La foto del producto no parece ser una imagen válida.")
+
+    return {
+        "data": data,
+        "mime_type": file_storage.mimetype,
+        "filename": original[:180],
+    }
+
+
+def promotion_is_active(promo, now=None):
+    if not promo or not promo.active:
+        return False
+    now = now or datetime.now()
+    if promo.starts_at and now < promo.starts_at:
+        return False
+    if promo.ends_at and now > promo.ends_at:
+        return False
+    return True
+
+
+def effective_product_price(product):
+    promo = getattr(product, "promotion", None)
+    if promotion_is_active(promo):
+        return Decimal(promo.promo_price or 0)
+    return Decimal(product.sale_price or 0)
+
+
+def parse_optional_datetime(value):
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M")
+    except ValueError:
+        raise ValueError("La fecha de promoción no tiene un formato válido.")
 
 
 def safe_form_error(exc, fallback="No se pudo completar la operación."):
@@ -259,6 +354,19 @@ class Client(db.Model):
     payments = db.relationship("Payment", backref="client", lazy=True, cascade="all, delete-orphan")
 
 
+class CustomerProfile(db.Model):
+    """Vincula una cuenta de acceso CLIENTE con su ficha comercial."""
+    __tablename__ = "customer_profiles"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    client_id = db.Column(db.Integer, db.ForeignKey("clients.id"), nullable=False, unique=True, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+
+    user = db.relationship("User")
+    client = db.relationship("Client")
+
+
 class AuditLog(db.Model):
     __tablename__ = "audit_logs"
 
@@ -297,6 +405,46 @@ class Product(db.Model):
     minimum_stock = db.Column(db.Integer, nullable=False, default=0)
     active = db.Column(db.Boolean, nullable=False, default=True)
     created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+
+
+class ProductImage(db.Model):
+    """
+    Imagen pública del producto.
+    Se guarda en PostgreSQL para que no se pierda en redeploys de Render.
+    """
+    __tablename__ = "product_images"
+
+    id = db.Column(db.Integer, primary_key=True)
+    product_id = db.Column(db.Integer, db.ForeignKey("products.id"), nullable=False, unique=True, index=True)
+    image_data = db.Column(db.LargeBinary, nullable=False)
+    mime_type = db.Column(db.String(50), nullable=False)
+    filename = db.Column(db.String(180), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+
+    product = db.relationship(
+        "Product",
+        backref=db.backref("catalog_image", uselist=False, cascade="all, delete-orphan")
+    )
+
+
+class ProductPromotion(db.Model):
+    """Promoción opcional del producto sin alterar la tabla products existente."""
+    __tablename__ = "product_promotions"
+
+    id = db.Column(db.Integer, primary_key=True)
+    product_id = db.Column(db.Integer, db.ForeignKey("products.id"), nullable=False, unique=True, index=True)
+    label = db.Column(db.String(80), nullable=False, default="PROMOCIÓN")
+    promo_price = db.Column(db.Numeric(12, 2), nullable=False)
+    active = db.Column(db.Boolean, nullable=False, default=True)
+    starts_at = db.Column(db.DateTime, nullable=True)
+    ends_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    product = db.relationship(
+        "Product",
+        backref=db.backref("promotion", uselist=False, cascade="all, delete-orphan")
+    )
 
 
 class InventoryMovement(db.Model):
@@ -435,18 +583,19 @@ def security_headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(self)"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
         "img-src 'self' data:; "
         "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
         "font-src 'self' https://cdn.jsdelivr.net https://fonts.gstatic.com data:; "
         "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "connect-src 'self' https://api.open-meteo.com; "
         "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
     )
     if IS_PRODUCTION:
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    if request.endpoint not in {"uploaded_file"}:
+    if request.endpoint not in {"uploaded_file", "product_image_file"}:
         response.headers.setdefault("Cache-Control", "no-store")
     return response
 
@@ -461,7 +610,9 @@ BASE_TEMPLATE = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ title or 'YM Store' }}</title>
+  <title>YM Store</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='ym-logo.png') }}">
+  <link rel="apple-touch-icon" href="{{ url_for('static', filename='ym-logo.png') }}">
 
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1006,6 +1157,131 @@ BASE_TEMPLATE = """
       .login-card{border-radius:24px}
       .login-form{padding:34px 22px}
     }
+
+    .public-nav{
+      width:min(1180px,calc(100% - 28px));
+      margin:18px auto 0;
+      display:flex;align-items:center;justify-content:space-between;gap:16px;
+      background:rgba(255,255,255,.84);backdrop-filter:blur(18px);
+      border:1px solid rgba(231,235,243,.92);border-radius:20px;
+      padding:12px 15px;box-shadow:0 14px 38px rgba(21,31,54,.07);
+      position:sticky;top:12px;z-index:50;
+    }
+    .public-wrap{width:min(1180px,calc(100% - 28px));margin:0 auto;padding:34px 0 60px}
+    .store-hero{
+      border-radius:30px;padding:48px;color:#fff;overflow:hidden;position:relative;
+      background:
+        radial-gradient(circle at 85% 20%,rgba(255,255,255,.19),transparent 22%),
+        linear-gradient(135deg,#111c3d 0%,#5938dc 55%,#f04d9f 115%);
+      box-shadow:0 26px 70px rgba(73,49,172,.20);
+    }
+    .store-hero h1{font-size:clamp(34px,6vw,64px);font-weight:950;letter-spacing:-2px;max-width:720px}
+    .store-hero p{font-size:16px;color:rgba(255,255,255,.82);max-width:620px}
+    .product-card{
+      height:100%;background:#fff;border:1px solid #e9edf5;border-radius:23px;
+      padding:19px;box-shadow:0 14px 38px rgba(21,31,54,.07);
+      transition:transform .2s ease,box-shadow .2s ease;
+    }
+    .product-card:hover{transform:translateY(-5px);box-shadow:0 22px 48px rgba(21,31,54,.12)}
+    .product-art{
+      height:155px;border-radius:18px;display:grid;place-items:center;font-size:54px;
+      background:linear-gradient(145deg,#f2efff,#edf8ff);color:#6d4aff;margin-bottom:17px;
+    }
+    .price{font-size:22px;font-weight:950;color:#161d31}
+    .customer-hero{
+      padding:28px;border-radius:25px;color:#fff;
+      background:linear-gradient(135deg,#5435e9,#7d4cff 52%,#ee4c9d);
+      box-shadow:0 20px 48px rgba(91,58,225,.18);
+    }
+    .cart-pill{background:#111a33;color:#fff;border-radius:999px;padding:9px 14px;font-weight:800;font-size:12px}
+
+
+    .ym-logo-img{
+      width:52px;height:52px;border-radius:15px;object-fit:cover;
+      box-shadow:0 10px 26px rgba(0,0,0,.18);border:1px solid rgba(255,255,255,.16);
+    }
+    .login-brand-image{
+      width:190px;height:190px;object-fit:cover;border-radius:28px;
+      border:1px solid rgba(255,255,255,.14);
+      box-shadow:0 26px 65px rgba(0,0,0,.35);
+    }
+    .client-luxury-hero{
+      min-height:390px;border-radius:32px;padding:34px 38px;color:white;
+      display:grid;grid-template-columns:1.3fr .7fr;gap:28px;align-items:center;
+      overflow:hidden;position:relative;
+      background:
+        radial-gradient(circle at 80% 20%,rgba(255,255,255,.10),transparent 22%),
+        radial-gradient(circle at 15% 90%,rgba(116,80,255,.22),transparent 28%),
+        linear-gradient(135deg,#030303 0%,#0b0b0f 48%,#171522 100%);
+      box-shadow:0 28px 75px rgba(7,7,15,.22);
+    }
+    .client-luxury-hero::after{
+      content:"";position:absolute;width:390px;height:390px;border-radius:50%;
+      border:1px solid rgba(255,255,255,.08);right:-170px;top:-120px;
+    }
+    .hero-logo-large{
+      width:min(300px,100%);aspect-ratio:1/1;object-fit:cover;border-radius:28px;
+      margin:auto;box-shadow:0 24px 70px rgba(0,0,0,.45);
+      border:1px solid rgba(255,255,255,.13);
+    }
+    .luxury-kicker{
+      text-transform:uppercase;letter-spacing:2.3px;font-size:10px;font-weight:850;
+      color:#d9d9df;
+    }
+    .client-luxury-hero h1{
+      font-size:clamp(36px,5vw,68px);line-height:.98;font-weight:950;letter-spacing:-2.2px;
+      margin:12px 0 18px;
+    }
+    .client-luxury-hero p{max-width:610px;color:#c8c8d0;font-size:15px;line-height:1.7}
+    .client-widget{
+      background:linear-gradient(145deg,#fff,#fbfbfd);border:1px solid #e8eaf0;
+      border-radius:22px;padding:19px 21px;box-shadow:0 14px 36px rgba(21,31,54,.07);
+    }
+    .weather-icon{
+      width:45px;height:45px;border-radius:15px;display:grid;place-items:center;
+      color:white;font-size:21px;background:linear-gradient(135deg,#161620,#7868ff);
+    }
+    .quote-card{
+      background:linear-gradient(135deg,#15151a,#262331);color:#fff;
+      border-radius:22px;padding:20px 22px;box-shadow:0 14px 36px rgba(18,18,25,.13);
+    }
+    .quote-card .quote{font-size:15px;line-height:1.55;font-weight:650}
+    .catalog-img{
+      width:100%;height:230px;object-fit:cover;border-radius:18px;
+      background:#f3f3f6;margin-bottom:17px;
+    }
+    .catalog-placeholder{
+      height:230px;border-radius:18px;display:grid;place-items:center;
+      background:linear-gradient(145deg,#f4f4f7,#ececf2);font-size:54px;color:#6d657a;margin-bottom:17px;
+    }
+    .admin-product-thumb{
+      width:46px;height:46px;object-fit:cover;border-radius:12px;border:1px solid #e6e8ee;
+      background:#f4f5f7;
+    }
+    .available-dot{width:7px;height:7px;border-radius:50%;background:#1dbc7b;display:inline-block}
+    .client-greeting{font-size:13px;color:#bdbdc8;margin-bottom:4px}
+    @media(max-width:900px){
+      .client-luxury-hero{grid-template-columns:1fr;padding:30px 24px}
+      .hero-logo-large{width:220px}
+    }
+
+
+    .promo-badge{
+      display:inline-flex;align-items:center;gap:5px;padding:7px 10px;border-radius:999px;
+      background:linear-gradient(135deg,#16161c,#40365e);color:#fff;font-size:10px;font-weight:900;
+      letter-spacing:.5px;text-transform:uppercase;box-shadow:0 8px 18px rgba(31,26,48,.16);
+    }
+    .promo-price{font-size:23px;font-weight:950;color:#d63878}
+    .old-price{font-size:12px;color:#9aa1af;text-decoration:line-through;margin-left:7px}
+    .promo-admin{
+      border:1px solid #e7e2fa;background:linear-gradient(145deg,#fbfaff,#f7f3ff);
+      border-radius:18px;padding:18px;
+    }
+    .edit-product-image{
+      width:150px;height:150px;object-fit:cover;border-radius:20px;border:1px solid #e6e8ee;
+      box-shadow:0 14px 32px rgba(21,31,54,.08);
+    }
+
   </style>
 </head>
 <body>
@@ -1014,13 +1290,14 @@ BASE_TEMPLATE = """
 <div class="app-shell">
   <aside class="sidebar" id="sidebar">
     <div class="brand">
-      <div class="brand-mark">YM</div>
+      <img src="{{ url_for('static', filename='ym-logo.png') }}" class="ym-logo-img" alt="YM Store">
       <div>
         <div class="brand-title">YM Store</div>
         <div class="brand-sub">Todo en un solo lugar</div>
       </div>
     </div>
 
+    {% if user.role == 'ADMIN' %}
     <a class="side-link {{ 'active' if active=='dashboard' else '' }}" href="{{ url_for('dashboard') }}">
       <i class="bi bi-grid-1x2-fill"></i> Dashboard
     </a>
@@ -1044,8 +1321,25 @@ BASE_TEMPLATE = """
     <a class="side-link {{ 'active' if active=='tandas' else '' }}" href="{{ url_for('tandas') }}">
       <i class="bi bi-coin"></i> Tandas
     </a>
+    {% else %}
+    <a class="side-link {{ 'active' if active=='customer_home' else '' }}" href="{{ url_for('customer_home') }}">
+      <i class="bi bi-house-heart"></i> Mi inicio
+    </a>
+    <a class="side-link {{ 'active' if active=='store' else '' }}" href="{{ url_for('store') }}">
+      <i class="bi bi-shop"></i> Tienda
+    </a>
+    <a class="side-link {{ 'active' if active=='cart' else '' }}" href="{{ url_for('cart') }}">
+      <i class="bi bi-cart3"></i> Mi carrito
+    </a>
+    <a class="side-link {{ 'active' if active=='orders' else '' }}" href="{{ url_for('customer_orders') }}">
+      <i class="bi bi-bag-check"></i> Mis compras
+    </a>
+    <a class="side-link {{ 'active' if active=='customer_account' else '' }}" href="{{ url_for('customer_account') }}">
+      <i class="bi bi-wallet2"></i> Mi cuenta y pagos
+    </a>
+    {% endif %}
 
-    <div class="nav-section">Administración</div>
+    <div class="nav-section">Cuenta</div>
     <a class="side-link {{ 'active' if active=='account' else '' }}" href="{{ url_for('change_password') }}">
       <i class="bi bi-key"></i> Cambiar contraseña
     </a>
@@ -1119,6 +1413,596 @@ def page(content, title="YM Store", active="", **context):
     )
 
 
+
+# ============================================================
+# TIENDA PÚBLICA / CLIENTES
+# ============================================================
+
+@app.route("/")
+def store():
+    products_list = Product.query.filter(
+        Product.active.is_(True),
+        Product.stock > 0
+    ).order_by(Product.name).all()
+
+    promo_map = {
+        p.id: p.promotion
+        for p in products_list
+        if promotion_is_active(getattr(p, "promotion", None))
+    }
+
+    cart_data = session.get("cart", {})
+    cart_count = sum(int(qty) for qty in cart_data.values()) if isinstance(cart_data, dict) else 0
+
+    return page("""
+    <nav class="public-nav">
+      <a href="{{ url_for('store') }}" class="d-flex align-items-center gap-3">
+        <img src="{{ url_for('static', filename='ym-logo.png') }}" class="ym-logo-img" alt="YM Store">
+        <div>
+          <div style="font-weight:950;color:#111827;letter-spacing:.2px">YM Store</div>
+          <div class="section-sub">Tu estilo, aquí.</div>
+        </div>
+      </a>
+      <div class="d-flex gap-2 align-items-center">
+        <a class="cart-pill" href="{{ url_for('cart') }}"><i class="bi bi-cart3 me-1"></i> {{ cart_count }}</a>
+        {% if user %}
+          <a class="btn btn-gradient" href="{{ user_home_url(user) }}">Mi cuenta</a>
+        {% else %}
+          <a class="btn btn-light" href="{{ url_for('login') }}">Entrar</a>
+          <a class="btn btn-gradient" href="{{ url_for('register') }}">Crear cuenta</a>
+        {% endif %}
+      </div>
+    </nav>
+
+    <div class="public-wrap">
+      <section class="client-luxury-hero mb-4">
+        <div style="position:relative;z-index:2">
+          <div class="luxury-kicker">YM STORE • MORE THAN A STORE</div>
+          <h1>Tu estilo empieza aquí.</h1>
+          <p>Descubre productos seleccionados para ti. Compra desde tu cuenta, consulta tus pedidos y mantén el control de tus pagos de una forma sencilla y elegante.</p>
+          <div class="d-flex gap-2 flex-wrap mt-4">
+            <a href="#catalogo" class="btn btn-light px-4 py-3"><i class="bi bi-bag me-1"></i> Ver colección</a>
+            {% if not user %}<a href="{{ url_for('register') }}" class="btn btn-outline-light px-4 py-3">Crear mi cuenta</a>{% endif %}
+          </div>
+        </div>
+        <img src="{{ url_for('static', filename='ym-logo.png') }}" class="hero-logo-large" alt="Logo YM Store">
+      </section>
+
+      <div class="row g-3 mb-5">
+        <div class="col-md-6">
+          <div class="client-widget h-100">
+            <div class="d-flex align-items-center gap-3">
+              <div class="weather-icon"><i class="bi bi-cloud-sun"></i></div>
+              <div>
+                <div class="section-sub">El clima contigo</div>
+                <div id="weatherText" style="font-weight:900;font-size:16px">Consulta el clima de tu ubicación</div>
+                <div id="weatherDetail" class="section-sub">Activa ubicación para personalizar tu experiencia.</div>
+              </div>
+            </div>
+            <button id="weatherBtn" class="btn btn-light btn-sm mt-3" type="button" onclick="loadYMWeather()">Ver mi clima</button>
+          </div>
+        </div>
+        <div class="col-md-6">
+          <div class="quote-card h-100">
+            <div class="luxury-kicker mb-2">FRASE YM DE HOY</div>
+            <div class="quote" id="ymQuote">“Tu estilo habla antes que tú. Elige algo que te haga sentir increíble.”</div>
+          </div>
+        </div>
+      </div>
+
+      <div id="catalogo" class="d-flex justify-content-between align-items-end mb-3">
+        <div>
+          <div class="luxury-kicker" style="color:#777">COLECCIÓN YM</div>
+          <h2 class="fw-black mb-1" style="font-weight:950;font-size:30px">Productos para ti</h2>
+          <div class="section-sub">Solo mostramos lo que está disponible para compra.</div>
+        </div>
+      </div>
+
+      <div class="row g-4">
+        {% for p in products_list %}
+        <div class="col-sm-6 col-lg-4 col-xl-3">
+          <div class="product-card">
+            {% if p.catalog_image %}
+              <img class="catalog-img" src="{{ url_for('product_image_file', product_id=p.id) }}" alt="{{ p.name }}">
+            {% else %}
+              <div class="catalog-placeholder"><i class="bi bi-bag-heart"></i></div>
+            {% endif %}
+            <div class="section-sub mb-1">{{ p.sku }}</div>
+            <h3 class="h6 fw-bold mb-2" style="font-size:16px">{{ p.name }}</h3>
+            <p class="text-secondary" style="font-size:12px;min-height:38px">{{ p.description or 'Una selección especial de YM Store.' }}</p>
+            {% if p.id in promo_map %}
+              <div class="mb-2"><span class="promo-badge"><i class="bi bi-stars"></i> {{ promo_map[p.id].label }}</span></div>
+              <div class="d-flex justify-content-between align-items-end mb-3">
+                <div><span class="promo-price">{{ promo_map[p.id].promo_price|money }}</span><span class="old-price">{{ p.sale_price|money }}</span></div>
+                <span class="section-sub"><span class="available-dot me-1"></span> Disponible</span>
+              </div>
+            {% else %}
+              <div class="d-flex justify-content-between align-items-center mb-3">
+                <div class="price">{{ p.sale_price|money }}</div>
+                <span class="section-sub"><span class="available-dot me-1"></span> Disponible</span>
+              </div>
+            {% endif %}
+            <form method="post" action="{{ url_for('add_to_cart', product_id=p.id) }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="quantity" value="1">
+              <button class="btn btn-gradient w-100 py-3"><i class="bi bi-cart-plus me-1"></i> Agregar a mi carrito</button>
+            </form>
+          </div>
+        </div>
+        {% else %}
+        <div class="col-12"><div class="panel p-5 text-center text-secondary">Próximamente habrá nuevos productos disponibles.</div></div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <script>
+      const ymQuotes = [
+        "El estilo verdadero no sigue tendencias: deja una impresión.",
+        "Elegir bien también es una forma de cuidar cómo quieres sentirte hoy.",
+        "Los mejores detalles son los que terminan formando parte de tu historia.",
+        "La elegancia comienza cuando eliges con intención y lo haces tuyo.",
+        "Tu estilo no necesita hablar fuerte para hacerse notar.",
+        "Cada elección puede convertirse en ese detalle que transforma tu día.",
+        "Lo especial no siempre es lo más grande; a veces es exactamente lo que elegiste para ti.",
+        "La confianza es el mejor complemento. Todo lo demás solo la acompaña.",
+        "Haz de lo cotidiano algo que se sienta exclusivamente tuyo.",
+        "Un buen estilo no se trata de impresionar: se trata de representar quién eres."
+      ];
+      const quoteIndex = new Date().getDate() % ymQuotes.length;
+      document.getElementById("ymQuote").textContent = "“" + ymQuotes[quoteIndex] + "”";
+
+      function weatherLabel(code){
+        if ([0].includes(code)) return "Despejado";
+        if ([1,2,3].includes(code)) return "Parcialmente nublado";
+        if ([45,48].includes(code)) return "Con neblina";
+        if ([51,53,55,56,57].includes(code)) return "Llovizna";
+        if ([61,63,65,66,67,80,81,82].includes(code)) return "Con lluvia";
+        if ([71,73,75,77,85,86].includes(code)) return "Con nieve";
+        if ([95,96,99].includes(code)) return "Tormenta";
+        return "Clima actual";
+      }
+
+      function loadYMWeather(){
+        const btn = document.getElementById("weatherBtn");
+        const title = document.getElementById("weatherText");
+        const detail = document.getElementById("weatherDetail");
+        if (!navigator.geolocation){
+          detail.textContent = "Tu navegador no permite consultar ubicación.";
+          return;
+        }
+        btn.disabled = true;
+        title.textContent = "Consultando tu clima...";
+        navigator.geolocation.getCurrentPosition(async (pos) => {
+          try{
+            const lat = pos.coords.latitude;
+            const lon = pos.coords.longitude;
+            const endpoint = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,apparent_temperature,weather_code&temperature_unit=celsius`;
+            const response = await fetch(endpoint);
+            if (!response.ok) throw new Error("weather");
+            const data = await response.json();
+            const current = data.current;
+            title.textContent = `${Math.round(current.temperature_2m)}°C · ${weatherLabel(current.weather_code)}`;
+            detail.textContent = `Sensación térmica ${Math.round(current.apparent_temperature)}°C · Tu ubicación`;
+            btn.textContent = "Actualizar clima";
+          }catch(e){
+            title.textContent = "No pudimos cargar el clima";
+            detail.textContent = "Puedes seguir comprando normalmente.";
+          }finally{
+            btn.disabled = false;
+          }
+        }, () => {
+          title.textContent = "Tu privacidad primero";
+          detail.textContent = "No compartiste ubicación. La tienda funciona normalmente.";
+          btn.disabled = false;
+        }, {timeout:8000, maximumAge:600000});
+      }
+
+      window.addEventListener("DOMContentLoaded", () => {
+        setTimeout(() => loadYMWeather(), 500);
+      });
+    </script>
+    """, title="YM Store", products_list=products_list, promo_map=promo_map, cart_count=cart_count, user=current_user(), user_home_url=user_home_url)
+
+
+@app.route("/registro", methods=["GET", "POST"])
+@limiter.limit("5 per hour")
+def register():
+    if current_user():
+        return redirect(user_home_url())
+
+    if request.method == "POST":
+        try:
+            name = validate_text(request.form.get("name"), "Nombre", 120, required=True)
+            email = validate_text(request.form.get("email"), "Correo", 150, required=True).lower()
+            phone = validate_text(request.form.get("phone"), "Teléfono", 30)
+            address = validate_text(request.form.get("address"), "Dirección", 300)
+            password = request.form.get("password", "")
+            confirm = request.form.get("confirm_password", "")
+
+            if "@" not in email or "." not in email.rsplit("@", 1)[-1]:
+                raise ValueError("Ingresa un correo válido.")
+            if User.query.filter(func.lower(User.username) == email).first():
+                raise ValueError("Ya existe una cuenta con ese correo.")
+            if len(password) < 10:
+                raise ValueError("La contraseña debe tener al menos 10 caracteres.")
+            if not any(c.isupper() for c in password) or not any(c.islower() for c in password) or not any(c.isdigit() for c in password):
+                raise ValueError("La contraseña debe incluir mayúscula, minúscula y número.")
+            if password != confirm:
+                raise ValueError("Las contraseñas no coinciden.")
+
+            client = Client(name=name, phone=phone, email=email, address=address)
+            db.session.add(client)
+            db.session.flush()
+
+            user = User(name=name, username=email, role="CLIENTE", active=True)
+            user.set_password(password)
+            db.session.add(user)
+            db.session.flush()
+
+            db.session.add(CustomerProfile(user_id=user.id, client_id=client.id))
+            audit("CUSTOMER_REGISTER", "CLIENT", client.id, details=email)
+            db.session.commit()
+
+            session.clear()
+            session.permanent = True
+            session["user_id"] = user.id
+            flash("¡Tu cuenta fue creada! Bienvenido(a) a YM Store.", "success")
+            return redirect(url_for("customer_home"))
+
+        except Exception as e:
+            safe_form_error(e)
+
+    return page("""
+    <div class="login-page">
+      <div class="panel p-4 p-md-5" style="width:min(680px,95vw)">
+        <a href="{{ url_for('store') }}" class="d-flex align-items-center gap-3 mb-4">
+          <img src="{{ url_for('static', filename='ym-logo.png') }}" class="ym-logo-img" alt="YM Store">
+          <div><div style="font-weight:950;font-size:22px;color:#111827">Crear cuenta</div><div class="section-sub">Cliente YM Store</div></div>
+        </a>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% for category, message in messages %}<div class="alert alert-{{ 'danger' if category=='danger' else category }}">{{ message }}</div>{% endfor %}
+        {% endwith %}
+        <form method="post">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <div class="row g-3">
+            <div class="col-md-6"><label class="form-label fw-bold">Nombre completo</label><input class="form-control" name="name" required maxlength="120"></div>
+            <div class="col-md-6"><label class="form-label fw-bold">Teléfono</label><input class="form-control" name="phone" maxlength="30"></div>
+            <div class="col-12"><label class="form-label fw-bold">Correo</label><input class="form-control" type="email" name="email" required maxlength="150"></div>
+            <div class="col-12"><label class="form-label fw-bold">Dirección</label><input class="form-control" name="address" maxlength="300"></div>
+            <div class="col-md-6"><label class="form-label fw-bold">Contraseña</label><input class="form-control" type="password" name="password" minlength="10" required></div>
+            <div class="col-md-6"><label class="form-label fw-bold">Confirmar contraseña</label><input class="form-control" type="password" name="confirm_password" minlength="10" required></div>
+          </div>
+          <div class="section-sub mt-3">Usa mínimo 10 caracteres con mayúscula, minúscula y número.</div>
+          <button class="btn btn-gradient w-100 py-3 mt-4">Crear mi cuenta</button>
+        </form>
+        <div class="text-center mt-4" style="font-size:12px">¿Ya tienes cuenta? <a href="{{ url_for('login') }}" style="font-weight:800;color:#7047ff">Iniciar sesión</a></div>
+      </div>
+    </div>
+    """, title="Registro")
+
+
+@app.route("/carrito/agregar/<int:product_id>", methods=["POST"])
+@limiter.limit("60 per minute")
+def add_to_cart(product_id):
+    product = db.session.get(Product, product_id)
+    if not product or not product.active or product.stock <= 0:
+        flash("Este producto ya no está disponible.", "warning")
+        return redirect(url_for("store"))
+
+    try:
+        qty = int(request.form.get("quantity", 1))
+    except ValueError:
+        qty = 1
+    qty = max(1, min(qty, 20))
+
+    cart_data = session.get("cart", {})
+    if not isinstance(cart_data, dict):
+        cart_data = {}
+    current_qty = int(cart_data.get(str(product.id), 0))
+    cart_data[str(product.id)] = min(current_qty + qty, min(product.stock, 20))
+    session["cart"] = cart_data
+    session.modified = True
+    flash(f"{product.name} agregado al carrito.", "success")
+    return redirect(request.referrer or url_for("store"))
+
+
+@app.route("/carrito/quitar/<int:product_id>", methods=["POST"])
+def remove_from_cart(product_id):
+    cart_data = session.get("cart", {})
+    if isinstance(cart_data, dict):
+        cart_data.pop(str(product_id), None)
+        session["cart"] = cart_data
+        session.modified = True
+    return redirect(url_for("cart"))
+
+
+@app.route("/carrito")
+def cart():
+    cart_data = session.get("cart", {})
+    items = []
+    total = Decimal("0")
+    if isinstance(cart_data, dict):
+        for product_id, qty in list(cart_data.items()):
+            try:
+                product = db.session.get(Product, int(product_id))
+                qty = max(1, int(qty))
+            except (ValueError, TypeError):
+                continue
+            if not product or not product.active:
+                continue
+            qty = min(qty, product.stock)
+            unit_price = effective_product_price(product)
+            subtotal = unit_price * qty
+            total += subtotal
+            items.append((product, qty, unit_price, subtotal))
+
+    return page("""
+    {% if not user %}
+    <nav class="public-nav">
+      <a href="{{ url_for('store') }}" class="d-flex align-items-center gap-2"><img src="{{ url_for('static', filename='ym-logo.png') }}" class="ym-logo-img" style="width:44px;height:44px;border-radius:14px" alt="YM Store"><strong style="color:#111827">YM Store</strong></a>
+      <a class="btn btn-light" href="{{ url_for('store') }}">Seguir comprando</a>
+    </nav>
+    <div class="public-wrap">
+    {% else %}
+    <div class="mb-4"><div class="hero-title">Mi carrito</div><div class="hero-sub">Revisa tu compra antes de confirmar.</div></div>
+    {% endif %}
+
+      <div class="panel p-4">
+        {% for product, qty, unit_price, subtotal in items %}
+          <div class="d-flex flex-wrap gap-3 align-items-center justify-content-between py-3 border-bottom">
+            <div><strong>{{ product.name }}</strong><div class="section-sub">{{ qty }} × {{ unit_price|money }}</div></div>
+            <div class="d-flex align-items-center gap-3"><strong>{{ subtotal|money }}</strong>
+              <form method="post" action="{{ url_for('remove_from_cart', product_id=product.id) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="btn btn-sm btn-light"><i class="bi bi-trash"></i></button>
+              </form>
+            </div>
+          </div>
+        {% else %}
+          <div class="text-center py-5"><i class="bi bi-cart3" style="font-size:48px;color:#8f65ff"></i><h3 class="h5 fw-bold mt-3">Tu carrito está vacío</h3><a class="btn btn-gradient mt-2" href="{{ url_for('store') }}">Ver productos</a></div>
+        {% endfor %}
+
+        {% if items %}
+          <div class="d-flex justify-content-between align-items-center pt-4"><div><div class="section-sub">Total</div><div class="price">{{ total|money }}</div></div>
+          {% if user and user.role == 'CLIENTE' %}
+            <form method="post" action="{{ url_for('checkout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="btn btn-gradient py-3 px-4">Confirmar compra</button></form>
+          {% elif not user %}
+            <a class="btn btn-gradient py-3 px-4" href="{{ url_for('login') }}">Entrar para comprar</a>
+          {% endif %}
+          </div>
+        {% endif %}
+      </div>
+    {% if not user %}</div>{% endif %}
+    """, title="Carrito", active="cart", items=items, total=total, user=current_user())
+
+
+@app.route("/comprar/confirmar", methods=["POST"])
+@customer_required
+@limiter.limit("20 per hour")
+def checkout():
+    profile = get_customer_profile()
+    cart_data = session.get("cart", {})
+    if not isinstance(cart_data, dict) or not cart_data:
+        flash("Tu carrito está vacío.", "warning")
+        return redirect(url_for("cart"))
+
+    try:
+        requested = []
+        for pid, qty in cart_data.items():
+            requested.append((int(pid), max(1, int(qty))))
+
+        # En PostgreSQL, FOR UPDATE evita vender el mismo stock dos veces simultáneamente.
+        product_ids = [pid for pid, _ in requested]
+        products_locked = Product.query.filter(Product.id.in_(product_ids)).with_for_update().all()
+        product_map = {p.id: p for p in products_locked}
+
+        order_lines = []
+        total = Decimal("0")
+        for pid, qty in requested:
+            product = product_map.get(pid)
+            if not product or not product.active:
+                raise ValueError("Uno de los productos ya no está disponible.")
+            if qty > product.stock:
+                raise ValueError(f"Stock insuficiente para {product.name}. Disponible: {product.stock}.")
+            price = effective_product_price(product)
+            subtotal = price * qty
+            total += subtotal
+            order_lines.append((product, qty, price, subtotal))
+
+        if total <= 0:
+            raise ValueError("La compra no tiene un total válido.")
+
+        sale = Sale(client_id=profile.client_id, total=total, paid_now=0, status="PENDIENTE")
+        db.session.add(sale)
+        db.session.flush()
+
+        for product, qty, price, subtotal in order_lines:
+            db.session.add(SaleItem(sale_id=sale.id, product_id=product.id, quantity=qty, unit_price=price, subtotal=subtotal))
+            product.stock -= qty
+            add_inventory_movement(product, "VENTA_WEB", -qty, reference=f"WEB-{sale.id}")
+
+        create_account_movement(
+            profile.client_id,
+            "CARGO",
+            f"Compra web #{sale.id}",
+            charge=total,
+            reference=f"VENTA-{sale.id}"
+        )
+        audit("WEB_ORDER", "SALE", sale.id, details=f"total={total}")
+        db.session.commit()
+
+        session["cart"] = {}
+        session.modified = True
+        flash(f"¡Compra #{sale.id} confirmada! Puedes consultar tu saldo y enviar comprobante.", "success")
+        return redirect(url_for("customer_orders"))
+
+    except Exception as e:
+        safe_form_error(e, "No se pudo confirmar la compra.")
+        return redirect(url_for("cart"))
+
+
+@app.route("/mi-cuenta")
+@customer_required
+def customer_home():
+    profile = get_customer_profile()
+    client = profile.client
+    balance = client_balance(client.id)
+    orders = Sale.query.filter_by(client_id=client.id).order_by(Sale.created_at.desc()).limit(5).all()
+    pending_payments = Payment.query.filter_by(client_id=client.id, status="PENDIENTE").count()
+
+    return page("""
+    <div class="customer-hero mb-4" style="background:linear-gradient(135deg,#060609,#191723 62%,#513e9e)">
+      <div class="d-flex flex-wrap justify-content-between align-items-center gap-4">
+        <div>
+          <div class="client-greeting" id="clientGreeting">Bienvenido(a) a YM Store</div>
+          <h1 class="fw-bold mb-1">{{ client.name }}</h1>
+          <div style="color:rgba(255,255,255,.78)">Compra, disfruta y controla tu cuenta desde un solo lugar.</div>
+        </div>
+        <img src="{{ url_for('static', filename='ym-logo.png') }}" class="ym-logo-img" style="width:82px;height:82px;border-radius:22px" alt="YM Store">
+      </div>
+    </div>
+
+    <div class="row g-3 mb-4">
+      <div class="col-lg-4"><div class="panel p-4 h-100"><div class="section-sub">Saldo pendiente</div><div class="price {{ 'debt' if balance>0 else 'credit' }}">{{ balance|money }}</div><a class="btn btn-light btn-sm mt-3" href="{{ url_for('customer_account') }}">Ver mi cuenta</a></div></div>
+      <div class="col-lg-4">
+        <div class="client-widget h-100">
+          <div class="d-flex gap-3 align-items-center"><div class="weather-icon"><i class="bi bi-cloud-sun"></i></div><div><div class="section-sub">Clima para ti</div><div id="customerWeather" style="font-weight:900">Consulta tu clima</div><div id="customerWeatherDetail" class="section-sub">Con tu autorización.</div></div></div>
+          <button class="btn btn-light btn-sm mt-3" id="customerWeatherBtn" onclick="loadCustomerWeather()">Ver clima</button>
+        </div>
+      </div>
+      <div class="col-lg-4"><div class="quote-card h-100"><div class="luxury-kicker mb-2">UN DETALLE PARA HOY</div><div class="quote" id="customerQuote">“Disfruta lo que eliges y hazlo parte de tu estilo.”</div></div></div>
+    </div>
+
+    <div class="panel p-4 mb-4">
+      <div class="d-flex flex-wrap gap-2">
+        <a class="btn btn-gradient" href="{{ url_for('store') }}"><i class="bi bi-shop me-1"></i> Ir de compras</a>
+        <a class="btn btn-light" href="{{ url_for('customer_orders') }}"><i class="bi bi-bag-check me-1"></i> Mis compras</a>
+        {% if balance > 0 %}<a class="btn btn-light" href="{{ url_for('public_payment', token=client.payment_token) }}"><i class="bi bi-cloud-arrow-up me-1"></i> Enviar comprobante</a>{% endif %}
+      </div>
+    </div>
+
+    <div class="panel p-4">
+      <div class="d-flex justify-content-between align-items-center mb-3">
+        <div><h2 class="section-title">Compras recientes</h2><div class="section-sub">Tus últimos pedidos en YM Store</div></div>
+        <a class="btn btn-light" href="{{ url_for('customer_orders') }}">Ver todas</a>
+      </div>
+      {% for order in orders %}
+        <div class="d-flex justify-content-between align-items-center py-3 border-bottom">
+          <div><strong>Pedido #{{ order.id }}</strong><div class="section-sub">{{ order.created_at.strftime('%d/%m/%Y %H:%M') }}</div></div>
+          <div class="text-end"><strong>{{ order.total|money }}</strong><div class="section-sub">{{ order.status }}</div></div>
+        </div>
+      {% else %}<div class="text-center text-secondary py-4">Todavía no has realizado compras.</div>{% endfor %}
+    </div>
+
+    <script>
+      const hour = new Date().getHours();
+      document.getElementById("clientGreeting").textContent =
+        hour < 12 ? "Buenos días ✨" : hour < 19 ? "Buenas tardes ✨" : "Buenas noches ✨";
+
+      const customerQuotes = [
+        "Tu estilo se construye con decisiones pequeñas que se sienten completamente tuyas.",
+        "La confianza no se compra, pero elegir algo que amas puede recordártela.",
+        "Que lo que elijas hoy tenga un lugar especial en tus próximos recuerdos.",
+        "La verdadera elegancia está en sentirte cómodo con lo que representa quién eres.",
+        "Tu mejor versión no necesita comparación: solo intención.",
+        "Hay detalles que no cambian el mundo, pero sí pueden cambiar tu día.",
+        "El estilo más memorable siempre lleva algo de tu personalidad.",
+        "Disfruta elegir sin prisa; las mejores cosas se sienten correctas desde el principio."
+      ];
+      document.getElementById("customerQuote").textContent =
+        "“" + customerQuotes[new Date().getDate() % customerQuotes.length] + "”";
+
+      function customerWeatherLabel(code){
+        if (code === 0) return "Despejado";
+        if ([1,2,3].includes(code)) return "Parcialmente nublado";
+        if ([45,48].includes(code)) return "Con neblina";
+        if ([51,53,55,61,63,65,80,81,82].includes(code)) return "Con lluvia";
+        if ([95,96,99].includes(code)) return "Tormenta";
+        return "Clima actual";
+      }
+      function loadCustomerWeather(){
+        const btn=document.getElementById("customerWeatherBtn");
+        const title=document.getElementById("customerWeather");
+        const detail=document.getElementById("customerWeatherDetail");
+        if(!navigator.geolocation){detail.textContent="Ubicación no disponible.";return;}
+        btn.disabled=true; title.textContent="Consultando...";
+        navigator.geolocation.getCurrentPosition(async(pos)=>{
+          try{
+            const u=`https://api.open-meteo.com/v1/forecast?latitude=${pos.coords.latitude}&longitude=${pos.coords.longitude}&current=temperature_2m,apparent_temperature,weather_code&temperature_unit=celsius`;
+            const r=await fetch(u); if(!r.ok) throw new Error();
+            const d=await r.json(); const c=d.current;
+            title.textContent=`${Math.round(c.temperature_2m)}°C · ${customerWeatherLabel(c.weather_code)}`;
+            detail.textContent=`Sensación ${Math.round(c.apparent_temperature)}°C`;
+            btn.textContent="Actualizar";
+          }catch(e){title.textContent="Clima no disponible";detail.textContent="Inténtalo más tarde.";}
+          finally{btn.disabled=false;}
+        },()=>{title.textContent="Ubicación privada";detail.textContent="No compartiste tu ubicación.";btn.disabled=false;},{timeout:8000,maximumAge:600000});
+      }
+
+      window.addEventListener("DOMContentLoaded", () => {
+        setTimeout(() => loadCustomerWeather(), 500);
+      });
+    </script>
+    """, title="Mi cuenta", active="customer_home", client=client, balance=balance, orders=orders, pending_payments=pending_payments)
+
+
+@app.route("/mis-compras")
+@customer_required
+def customer_orders():
+    profile = get_customer_profile()
+    orders = Sale.query.filter_by(client_id=profile.client_id).order_by(Sale.created_at.desc()).all()
+
+    return page("""
+    <div class="mb-4"><div class="hero-title">Mis compras</div><div class="hero-sub">Historial de pedidos realizados en YM Store.</div></div>
+    <div class="panel p-4">
+      {% for order in orders %}
+        <div class="py-4 border-bottom">
+          <div class="d-flex justify-content-between align-items-start gap-3 mb-3"><div><h2 class="section-title">Pedido #{{ order.id }}</h2><div class="section-sub">{{ order.created_at.strftime('%d/%m/%Y %H:%M') }}</div></div><div class="text-end"><div class="price">{{ order.total|money }}</div><span class="badge text-bg-{{ 'success' if order.status=='PAGADA' else 'warning' }}">{{ order.status }}</span></div></div>
+          {% for item in order.items %}
+            <div class="d-flex justify-content-between section-sub py-1"><span>{{ item.quantity }} × {{ item.product.name }}</span><span>{{ item.subtotal|money }}</span></div>
+          {% endfor %}
+        </div>
+      {% else %}<div class="text-center py-5 text-secondary">Aún no tienes compras. <a href="{{ url_for('store') }}">Ir a la tienda</a></div>{% endfor %}
+    </div>
+    """, title="Mis compras", active="orders", orders=orders)
+
+
+@app.route("/mi-cuenta/pagos")
+@customer_required
+def customer_account():
+    profile = get_customer_profile()
+    client = profile.client
+    balance = client_balance(client.id)
+    movements = AccountMovement.query.filter_by(client_id=client.id).order_by(AccountMovement.created_at.desc()).limit(100).all()
+    payments = Payment.query.filter_by(client_id=client.id).order_by(Payment.created_at.desc()).all()
+
+    return page("""
+    <div class="d-flex flex-wrap justify-content-between gap-3 mb-4">
+      <div><div class="hero-title">Mi cuenta y pagos</div><div class="hero-sub">Consulta cargos, abonos y comprobantes.</div></div>
+      <div class="panel p-3"><div class="section-sub">Saldo pendiente</div><div class="price {{ 'debt' if balance>0 else 'credit' }}">{{ balance|money }}</div></div>
+    </div>
+
+    {% if balance > 0 %}
+      <a class="btn btn-gradient mb-4" href="{{ url_for('public_payment', token=client.payment_token) }}"><i class="bi bi-cloud-arrow-up me-1"></i> Subir comprobante de pago</a>
+    {% endif %}
+
+    <div class="panel p-4 mb-4">
+      <h2 class="section-title mb-3">Estado de cuenta</h2>
+      <div class="table-responsive"><table class="table"><thead><tr><th>Fecha</th><th>Concepto</th><th>Cargo</th><th>Abono</th></tr></thead><tbody>
+      {% for m in movements %}<tr><td>{{ m.created_at.strftime('%d/%m/%Y') }}</td><td>{{ m.concept }}</td><td class="debt">{{ m.charge|money if m.charge else '-' }}</td><td class="credit">{{ m.credit|money if m.credit else '-' }}</td></tr>
+      {% else %}<tr><td colspan="4" class="text-center text-secondary">Sin movimientos.</td></tr>{% endfor %}
+      </tbody></table></div>
+    </div>
+
+    <div class="panel p-4">
+      <h2 class="section-title mb-3">Mis comprobantes</h2>
+      <div class="table-responsive"><table class="table"><thead><tr><th>Fecha</th><th>Monto</th><th>Referencia</th><th>Estado</th></tr></thead><tbody>
+      {% for p in payments %}<tr><td>{{ p.created_at.strftime('%d/%m/%Y') }}</td><td>{{ p.amount|money }}</td><td>{{ p.reference or '-' }}</td><td><span class="badge text-bg-{{ 'success' if p.status=='APROBADO' else 'warning' if p.status=='PENDIENTE' else 'danger' }}">{{ p.status }}</span></td></tr>
+      {% else %}<tr><td colspan="4" class="text-center text-secondary">Sin comprobantes.</td></tr>{% endfor %}
+      </tbody></table></div>
+    </div>
+    """, title="Mi cuenta", active="customer_account", client=client, balance=balance, movements=movements, payments=payments)
+
+
 # ============================================================
 # AUTH
 # ============================================================
@@ -1127,7 +2011,7 @@ def page(content, title="YM Store", active="", **context):
 @limiter.limit("5 per minute")
 def login():
     if current_user():
-        return redirect(url_for("dashboard"))
+        return redirect(user_home_url())
 
     if request.method == "POST":
         username = request.form.get("username", "").strip().lower()
@@ -1140,8 +2024,8 @@ def login():
             session["user_id"] = user.id
             audit("LOGIN_OK", "USER", user.id)
             db.session.commit()
-            flash(f"Bienvenida, {user.name}.", "success")
-            return redirect(url_for("dashboard"))
+            flash(f"Bienvenido(a), {user.name}.", "success")
+            return redirect(user_home_url(user))
 
         flash("Usuario o contraseña incorrectos.", "danger")
 
@@ -1150,7 +2034,7 @@ def login():
       <div class="login-card">
         <section class="login-brand">
           <div>
-            <div class="login-logo">YM</div>
+            <img src="{{ url_for('static', filename='ym-logo.png') }}" class="login-brand-image" alt="YM Store">
             <h1 class="mt-4 fw-black" style="font-weight:900;font-size:42px">YM Store</h1>
             <p style="color:#b8c2df;font-size:15px">Compras, pagos, inventario y tandas en una sola plataforma.</p>
           </div>
@@ -1167,9 +2051,9 @@ def login():
 
         <section class="login-form">
           <div class="mb-5">
-            <div class="badge-soft d-inline-block mb-3">Panel administrativo</div>
+            <div class="badge-soft d-inline-block mb-3">Acceso a tu cuenta</div>
             <h2 class="fw-bold mb-2" style="font-size:30px">Bienvenida 👋</h2>
-            <p class="text-secondary">Ingresa para administrar tu negocio.</p>
+            <p class="text-secondary">Ingresa como cliente o administrador.</p>
           </div>
 
           {% with messages = get_flashed_messages(with_categories=true) %}
@@ -1197,7 +2081,10 @@ def login():
             </button>
           </form>
 
-          <div class="text-center text-secondary mt-4" style="font-size:11px">
+          <div class="text-center mt-4" style="font-size:12px">
+            ¿Eres cliente nuevo? <a href="{{ url_for('register') }}" style="font-weight:800;color:#7047ff">Crear mi cuenta</a>
+          </div>
+          <div class="text-center text-secondary mt-3" style="font-size:11px">
             YM Store • Todo en un solo lugar
           </div>
         </section>
@@ -1216,7 +2103,7 @@ def logout():
 
 
 @app.route("/cuenta/cambiar-password", methods=["GET", "POST"])
-@admin_required
+@login_required
 @limiter.limit("10 per hour")
 def change_password():
     user = current_user()
@@ -1265,7 +2152,7 @@ def change_password():
 # DASHBOARD
 # ============================================================
 
-@app.route("/")
+@app.route("/admin")
 @admin_required
 def dashboard():
     total_clients = Client.query.filter_by(active=True).count()
@@ -1832,7 +2719,7 @@ def public_payment(token):
     <div class="login-page">
       <div class="panel p-4 p-md-5" style="width:min(610px,94vw)">
         <div class="d-flex align-items-center gap-3 mb-4">
-          <div class="brand-mark">YM</div>
+          <img src="{{ url_for('static', filename='ym-logo.png') }}" class="ym-logo-img" alt="YM Store">
           <div>
             <div class="brand-title" style="color:#111827">YM Store</div>
             <div class="section-sub">Portal de pagos</div>
@@ -1930,6 +2817,20 @@ def uploaded_file(filename):
     return send_from_directory(app.config["UPLOAD_FOLDER"], filename, as_attachment=True)
 
 
+
+@app.route("/catalogo/imagen/<int:product_id>")
+def product_image_file(product_id):
+    image = ProductImage.query.filter_by(product_id=product_id).first_or_404()
+    response = send_file(
+        BytesIO(image.image_data),
+        mimetype=image.mime_type,
+        download_name=image.filename,
+        max_age=86400
+    )
+    response.headers["Cache-Control"] = "public, max-age=86400"
+    return response
+
+
 # ============================================================
 # INVENTARIO
 # ============================================================
@@ -1954,6 +2855,15 @@ def products():
             )
             db.session.add(product)
             db.session.flush()
+
+            image_payload = product_image_payload(request.files.get("product_image"))
+            if image_payload:
+                db.session.add(ProductImage(
+                    product_id=product.id,
+                    image_data=image_payload["data"],
+                    mime_type=image_payload["mime_type"],
+                    filename=image_payload["filename"]
+                ))
 
             if product.stock:
                 add_inventory_movement(product, "ALTA_INICIAL", product.stock, reference="ALTA")
@@ -1982,8 +2892,11 @@ def products():
             <div><h2 class="section-title">Nuevo producto</h2><div class="section-sub">Crea un artículo en inventario</div></div>
           </div>
 
-          <form method="post">
+          <form method="post" enctype="multipart/form-data">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label class="form-label fw-bold">Foto para el catálogo</label>
+            <input class="form-control mb-3" type="file" name="product_image" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp">
+            <div class="section-sub mb-3">JPG, PNG o WEBP · máximo 3 MB. Esta foto sí la verá el cliente.</div>
             <input class="form-control mb-3" name="sku" placeholder="SKU / Código" required>
             <input class="form-control mb-3" name="name" placeholder="Nombre del producto" required>
             <textarea class="form-control mb-3" name="description" placeholder="Descripción"></textarea>
@@ -2008,21 +2921,38 @@ def products():
 
           <div class="table-responsive">
             <table class="table">
-              <thead><tr><th>SKU</th><th>Producto</th><th>Compra</th><th>Venta</th><th>Stock</th><th>Ajustar</th></tr></thead>
+              <thead><tr><th>SKU</th><th>Producto</th><th>Compra</th><th>Venta</th><th>Promo</th><th>Stock</th><th>Acciones</th></tr></thead>
               <tbody>
               {% for p in rows %}
                 <tr>
                   <td><span class="badge-soft">{{ p.sku }}</span></td>
-                  <td><strong>{{ p.name }}</strong><div class="section-sub">{{ p.description or '' }}</div></td>
+                  <td>
+                    <div class="d-flex align-items-center gap-2">
+                      {% if p.catalog_image %}
+                        <img src="{{ url_for('product_image_file', product_id=p.id) }}" class="admin-product-thumb" alt="{{ p.name }}">
+                      {% else %}
+                        <div class="admin-product-thumb d-grid place-items-center"></div>
+                      {% endif %}
+                      <div><strong>{{ p.name }}</strong><div class="section-sub">{{ p.description or '' }}</div></div>
+                    </div>
+                  </td>
                   <td>{{ p.purchase_price|money }}</td>
                   <td>{{ p.sale_price|money }}</td>
+                  <td>
+                    {% if promotion_is_active(p.promotion) %}
+                      <span class="badge text-bg-dark">{{ p.promotion.promo_price|money }}</span>
+                    {% else %}<span class="section-sub">—</span>{% endif %}
+                  </td>
                   <td><span class="badge rounded-pill text-bg-{{ 'danger' if p.stock <= p.minimum_stock else 'success' }}">{{ p.stock }}</span></td>
                   <td>
-                    <form class="d-flex gap-1" method="post" action="{{ url_for('adjust_stock', product_id=p.id) }}">
+                    <div class="d-flex gap-1 flex-wrap">
+                      <a class="btn btn-sm btn-gradient" href="{{ url_for('edit_product', product_id=p.id) }}"><i class="bi bi-pencil-square"></i> Editar</a>
+                      <form class="d-flex gap-1" method="post" action="{{ url_for('adjust_stock', product_id=p.id) }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                       <input class="form-control form-control-sm" style="width:80px" type="number" name="quantity" required placeholder="+/-">
                       <button class="btn btn-sm btn-light"><i class="bi bi-check-lg"></i></button>
-                    </form>
+                      </form>
+                    </div>
                   </td>
                 </tr>
               {% else %}
@@ -2034,7 +2964,192 @@ def products():
         </div>
       </div>
     </div>
-    """, title="Inventario", active="products", rows=rows)
+    """, title="Inventario", active="products", rows=rows, promotion_is_active=promotion_is_active)
+
+
+
+@app.route("/productos/<int:product_id>/editar", methods=["GET", "POST"])
+@admin_required
+def edit_product(product_id):
+    product = db.session.get(Product, product_id)
+    if not product:
+        abort(404)
+
+    if request.method == "POST":
+        try:
+            sku = validate_text(request.form.get("sku"), "SKU", 60, required=True).upper()
+            name = validate_text(request.form.get("name"), "Nombre", 150, required=True)
+            description = validate_text(request.form.get("description"), "Descripción", 2000)
+
+            duplicate = Product.query.filter(Product.sku == sku, Product.id != product.id).first()
+            if duplicate:
+                raise ValueError("Ya existe otro producto con ese SKU.")
+
+            purchase_price = Decimal(request.form.get("purchase_price", "0"))
+            sale_price = Decimal(request.form.get("sale_price", "0"))
+            minimum_stock = int(request.form.get("minimum_stock", 0))
+            if purchase_price < 0 or sale_price < 0 or minimum_stock < 0:
+                raise ValueError("Precios y stock mínimo no pueden ser negativos.")
+
+            product.sku = sku
+            product.name = name
+            product.description = description
+            product.purchase_price = purchase_price
+            product.sale_price = sale_price
+            product.minimum_stock = minimum_stock
+            product.active = request.form.get("active") == "on"
+
+            image_payload = product_image_payload(request.files.get("product_image"))
+            if image_payload:
+                if product.catalog_image:
+                    product.catalog_image.image_data = image_payload["data"]
+                    product.catalog_image.mime_type = image_payload["mime_type"]
+                    product.catalog_image.filename = image_payload["filename"]
+                    product.catalog_image.created_at = datetime.now()
+                else:
+                    db.session.add(ProductImage(
+                        product_id=product.id,
+                        image_data=image_payload["data"],
+                        mime_type=image_payload["mime_type"],
+                        filename=image_payload["filename"]
+                    ))
+
+            remove_promo = request.form.get("remove_promotion") == "on"
+            promo_enabled = request.form.get("promo_active") == "on"
+            promo_price_raw = (request.form.get("promo_price") or "").strip()
+            promo_label = validate_text(request.form.get("promo_label"), "Etiqueta de promoción", 80) or "PROMOCIÓN"
+            starts_at = parse_optional_datetime(request.form.get("promo_starts_at"))
+            ends_at = parse_optional_datetime(request.form.get("promo_ends_at"))
+
+            if starts_at and ends_at and ends_at <= starts_at:
+                raise ValueError("La promoción debe terminar después de su fecha de inicio.")
+
+            if remove_promo:
+                if product.promotion:
+                    db.session.delete(product.promotion)
+            elif promo_price_raw:
+                promo_price = Decimal(promo_price_raw)
+                if promo_price <= 0:
+                    raise ValueError("El precio promocional debe ser mayor a cero.")
+                if promo_price >= sale_price:
+                    raise ValueError("El precio promocional debe ser menor que el precio normal.")
+
+                if product.promotion:
+                    promo = product.promotion
+                    promo.label = promo_label
+                    promo.promo_price = promo_price
+                    promo.active = promo_enabled
+                    promo.starts_at = starts_at
+                    promo.ends_at = ends_at
+                    promo.updated_at = datetime.now()
+                else:
+                    db.session.add(ProductPromotion(
+                        product_id=product.id,
+                        label=promo_label,
+                        promo_price=promo_price,
+                        active=promo_enabled,
+                        starts_at=starts_at,
+                        ends_at=ends_at
+                    ))
+            elif product.promotion:
+                # Si existe pero dejan precio vacío, simplemente puede desactivarse.
+                product.promotion.active = False
+
+            audit("PRODUCT_EDIT", "PRODUCT", product.id, details=f"sku={product.sku}")
+            db.session.commit()
+            flash("Producto actualizado correctamente.", "success")
+            return redirect(url_for("edit_product", product_id=product.id))
+
+        except Exception as e:
+            safe_form_error(e, "No se pudo actualizar el producto.")
+
+    promo = product.promotion
+    return page("""
+    <div class="d-flex flex-wrap justify-content-between align-items-start gap-3 mb-4">
+      <div>
+        <div class="hero-title">Editar producto</div>
+        <div class="hero-sub">Cambia información, precio, imagen o promoción sin volver a crear el producto.</div>
+      </div>
+      <a class="btn btn-light" href="{{ url_for('products') }}"><i class="bi bi-arrow-left me-1"></i> Inventario</a>
+    </div>
+
+    <form method="post" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div class="row g-4">
+        <div class="col-xl-7">
+          <div class="panel p-4">
+            <div class="d-flex flex-wrap gap-4 align-items-center mb-4">
+              {% if product.catalog_image %}
+                <img class="edit-product-image" src="{{ url_for('product_image_file', product_id=product.id) }}" alt="{{ product.name }}">
+              {% else %}
+                <div class="edit-product-image d-grid" style="place-items:center;font-size:40px;color:#777"><i class="bi bi-image"></i></div>
+              {% endif %}
+              <div class="flex-grow-1">
+                <label class="form-label fw-bold">Cambiar foto del catálogo</label>
+                <input class="form-control" type="file" name="product_image" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp">
+                <div class="section-sub mt-2">Si no seleccionas otra imagen, se conserva la actual.</div>
+              </div>
+            </div>
+
+            <div class="row g-3">
+              <div class="col-md-5"><label class="form-label fw-bold">SKU</label><input class="form-control" name="sku" value="{{ product.sku }}" required></div>
+              <div class="col-md-7"><label class="form-label fw-bold">Nombre</label><input class="form-control" name="name" value="{{ product.name }}" required></div>
+              <div class="col-12"><label class="form-label fw-bold">Descripción</label><textarea class="form-control" name="description" rows="5">{{ product.description or '' }}</textarea></div>
+              <div class="col-md-4"><label class="form-label fw-bold">Costo</label><input class="form-control" type="number" step="0.01" min="0" name="purchase_price" value="{{ product.purchase_price }}"></div>
+              <div class="col-md-4"><label class="form-label fw-bold">Precio normal</label><input class="form-control" type="number" step="0.01" min="0" name="sale_price" value="{{ product.sale_price }}"></div>
+              <div class="col-md-4"><label class="form-label fw-bold">Stock mínimo</label><input class="form-control" type="number" min="0" name="minimum_stock" value="{{ product.minimum_stock }}"></div>
+              <div class="col-12">
+                <div class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" name="active" id="activeProduct" {% if product.active %}checked{% endif %}>
+                  <label class="form-check-label fw-bold" for="activeProduct">Producto visible/activo</label>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-xl-5">
+          <div class="promo-admin">
+            <div class="d-flex align-items-center gap-3 mb-3">
+              <div class="weather-icon"><i class="bi bi-stars"></i></div>
+              <div><h2 class="section-title">Promoción opcional</h2><div class="section-sub">Se refleja automáticamente en tienda, carrito y compra.</div></div>
+            </div>
+
+            <label class="form-label fw-bold">Etiqueta</label>
+            <input class="form-control mb-3" name="promo_label" value="{{ promo.label if promo else 'OFERTA ESPECIAL' }}" placeholder="OFERTA ESPECIAL">
+
+            <label class="form-label fw-bold">Precio promocional</label>
+            <input class="form-control mb-3" type="number" step="0.01" min="0.01" name="promo_price" value="{{ promo.promo_price if promo else '' }}" placeholder="Ej. 799.00">
+
+            <div class="row g-3">
+              <div class="col-6"><label class="form-label fw-bold">Inicia</label><input class="form-control" type="datetime-local" name="promo_starts_at" value="{{ promo.starts_at.strftime('%Y-%m-%dT%H:%M') if promo and promo.starts_at else '' }}"></div>
+              <div class="col-6"><label class="form-label fw-bold">Termina</label><input class="form-control" type="datetime-local" name="promo_ends_at" value="{{ promo.ends_at.strftime('%Y-%m-%dT%H:%M') if promo and promo.ends_at else '' }}"></div>
+            </div>
+
+            <div class="form-check form-switch mt-4">
+              <input class="form-check-input" type="checkbox" name="promo_active" id="promoActive" {% if promo and promo.active %}checked{% endif %}>
+              <label class="form-check-label fw-bold" for="promoActive">Promoción activa</label>
+            </div>
+
+            {% if promo %}
+            <div class="form-check mt-3">
+              <input class="form-check-input" type="checkbox" name="remove_promotion" id="removePromo">
+              <label class="form-check-label text-danger fw-bold" for="removePromo">Eliminar esta promoción</label>
+            </div>
+            {% endif %}
+          </div>
+
+          <div class="panel p-4 mt-4">
+            <div class="section-sub">Stock actual</div>
+            <div class="price">{{ product.stock }}</div>
+            <div class="section-sub mt-2">El stock se cambia desde “Inventario → Ajustar” para mantener un historial correcto.</div>
+          </div>
+        </div>
+      </div>
+
+      <button class="btn btn-gradient py-3 px-5 mt-4"><i class="bi bi-check2-circle me-1"></i> Guardar cambios</button>
+    </form>
+    """, title="YM Store", active="products", product=product, promo=promo)
 
 
 @app.route("/productos/<int:product_id>/ajustar", methods=["POST"])
